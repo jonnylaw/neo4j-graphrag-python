@@ -17,6 +17,7 @@ are listed in [the last section of this file](#customize).
 ## Build Knowledge Graph
 
 - [End to end PDF to graph simple pipeline](build_graph/simple_kg_builder_from_pdf.py)
+- [End to end PDF to graph with the new dataflow pipeline (`neo4j_graphrag.pipeline`)](kg_builder_new_pipeline.py)
 - [End to end text to graph simple pipeline](build_graph/simple_kg_builder_from_text.py)
 - [Build KG pipeline from config file](build_graph/from_config_files/simple_kg_pipeline_from_config_file.py)
 - [Build KG pipeline with PDF URL](build_graph/from_config_files/simple_kg_pipeline_from_config_file_with_url.py)

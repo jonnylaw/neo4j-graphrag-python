@@ -325,6 +325,30 @@ class LLMEntityRelationExtractor(EntityRelationExtractor):
             graph.relationships.extend(chunk_graph.relationships)
         return graph
 
+    async def extract_chunk(
+        self,
+        chunk: TextChunk,
+        schema: GraphSchema,
+        examples: str = "",
+        lexical_graph_builder: Optional[LexicalGraphBuilder] = None,
+    ) -> Neo4jGraph:
+        """Run extraction, validation and post processing for a single chunk,
+        without any concurrency control.
+
+        Intended for streaming callers that bound concurrency themselves
+        (e.g. :class:`~neo4j_graphrag.pipeline.kg_builder.SimpleKGPipeline`).
+        Batch callers should use :meth:`run`, which bounds concurrency with
+        a semaphore.
+        """
+        chunk_graph = await self.extract_for_chunk(schema, examples, chunk)
+        # final_chunk_graph = self.validate_chunk(chunk_graph, schema)
+        await self.post_process_chunk(
+            chunk_graph,
+            chunk,
+            lexical_graph_builder,
+        )
+        return chunk_graph
+
     async def run_for_chunk(
         self,
         sem: asyncio.Semaphore,
@@ -335,14 +359,12 @@ class LLMEntityRelationExtractor(EntityRelationExtractor):
     ) -> Neo4jGraph:
         """Run extraction, validation and post processing for a single chunk"""
         async with sem:
-            chunk_graph = await self.extract_for_chunk(schema, examples, chunk)
-            # final_chunk_graph = self.validate_chunk(chunk_graph, schema)
-            await self.post_process_chunk(
-                chunk_graph,
+            return await self.extract_chunk(
                 chunk,
+                schema,
+                examples,
                 lexical_graph_builder,
             )
-            return chunk_graph
 
     @validate_call
     async def run(

@@ -54,6 +54,7 @@ class DataLoader(Component):
         self,
         filepath: Union[str, Path],
         metadata: Optional[Dict[str, str]] = None,
+        fs: Optional[Union[AbstractFileSystem, str]] = None,
     ) -> LoadedDocument: ...
 
 

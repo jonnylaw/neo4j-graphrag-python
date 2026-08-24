@@ -48,6 +48,7 @@ from neo4j_graphrag.pipeline.pipeline import Pipeline, ResultPipeline
 from neo4j_graphrag.pipeline.result import Err, Ok, Result
 from neo4j_graphrag.pipeline.sink import Sink
 from neo4j_graphrag.pipeline.source import Source
+from neo4j_graphrag.pipeline.sources import FsspecFile, FsspecSource
 
 __all__ = [
     "Interpreter",
@@ -55,6 +56,8 @@ __all__ = [
     "Pipeline",
     "ResultPipeline",
     "Err",
+    "FsspecFile",
+    "FsspecSource",
     "Ok",
     "Result",
     "Sink",
