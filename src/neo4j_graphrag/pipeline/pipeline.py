@@ -14,6 +14,16 @@
 #  limitations under the License.
 """Embedded pipeline DSL: fluent builders over a pure-data operator graph.
 
+.. note::
+    This is not :class:`neo4j_graphrag.experimental.pipeline.Pipeline`.
+    That class is a task-graph orchestrator built from ``Component``
+    instances, wired with ``add_component`` / ``connect`` and run with
+    ``await pipeline.run(...)``; it still backs ``SimpleKGPipeline`` and is
+    scheduled for removal in 2.0.  This :class:`Pipeline` is an unrelated
+    dataflow DSL over a stream of elements.  The two are never used
+    together, and neither is re-exported from the other's package, so an
+    import always names which one you mean.
+
 :class:`Pipeline` and :class:`ResultPipeline` are **builders**.  Every
 operator method appends an
 :class:`~neo4j_graphrag.pipeline.operators.Operator` node to the definition
