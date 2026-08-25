@@ -76,6 +76,8 @@ from neo4j_graphrag.pipeline.operators import (
     TryMapOkAsyncChunked,
 )
 from neo4j_graphrag.pipeline.result import Err, Ok
+from neo4j_graphrag.pipeline.sink import Sink
+from neo4j_graphrag.pipeline.source import Source
 
 if TYPE_CHECKING:
     from neo4j_graphrag.pipeline.pipeline import Pipeline, ResultPipeline
@@ -98,8 +100,10 @@ class Interpreter(ABC):
     def evaluate(self, pipeline: Pipeline[Any] | ResultPipeline[Any]) -> Iterator[Any]:
         """Evaluate *pipeline* and return its output stream.
 
-        If the pipeline ends in a sink, the stream is consumed, written to
-        the sink, and an empty iterator is returned.
+        Implementations should not execute any user code before the
+        returned stream is consumed.  A pipeline ending in a sink returns a
+        stream that yields nothing but writes to the sink as it is drained,
+        so callers must exhaust it — :meth:`Pipeline.to_sink` does this.
         """
 
 
@@ -277,6 +281,34 @@ def _try_flat_map_ok(
                 yield Err(exception=e)
 
 
+def _read_source(source: Source[Any]) -> Iterator[Any]:
+    """Read *source*, deferred until the stream is consumed.
+
+    ``read()`` may open a file or a connection, so it must not run while
+    the generator chain is merely being built.
+    """
+    yield from source.read()
+
+
+def _reduce_lazy(
+    stream: Iterator[Any], zero: Any, combine: Callable[[Any, Any], Any]
+) -> Iterator[Any]:
+    """Fold *stream* into a single element, deferred until consumed.
+
+    The fold itself is not incremental — it drains the upstream — but it
+    does so on first ``next()`` rather than when the chain is built, so
+    ``evaluate()`` stays free of side effects.
+    """
+    yield _reduce(combine, stream, zero)
+
+
+def _to_sink(stream: Iterator[Any], sink: Sink[Any]) -> Iterator[Any]:
+    """Write every element of *stream* to *sink*, yielding nothing."""
+    for item in stream:
+        sink.write(item)
+    yield from ()
+
+
 def _on_error(stream: Iterator[Any], handler: Callable[[Err], None]) -> Iterator[Any]:
     for item in stream:
         if isinstance(item, Err):
@@ -293,10 +325,12 @@ def _on_error(stream: Iterator[Any], handler: Callable[[Err], None]) -> Iterator
 class LocalInterpreter(Interpreter):
     """Evaluate a pipeline in the current process with lazy generators.
 
-    Folds the operator list into a single generator chain.  Apart from
-    ``ReduceOp`` (which folds its upstream eagerly) and the blocking
-    chunked-async operators, no work happens until the returned stream is
-    consumed.
+    Folds the operator list into a single generator chain.  Building the
+    chain runs no user code: every operator — including ``ReduceOp`` and
+    ``SinkOp``, which both drain their upstream — defers its work until the
+    returned stream is consumed.  The chunked-async operators are the one
+    exception to incremental evaluation: each chunk blocks in
+    ``asyncio.run`` while it is being produced.
     """
 
     def evaluate(self, pipeline: Pipeline[Any] | ResultPipeline[Any]) -> Iterator[Any]:
@@ -304,7 +338,7 @@ class LocalInterpreter(Interpreter):
         for op in pipeline.pipeline_operators:
             match op:
                 case SourceOp(source=source):
-                    stream = iter(source.read())
+                    stream = _read_source(source)
                 case Map(func=func):
                     stream = map(func, stream)
                 case FlatMap(func=func):
@@ -320,7 +354,7 @@ class LocalInterpreter(Interpreter):
                 case Grouped(size=size):
                     stream = _batched(stream, size)
                 case ReduceOp(zero=zero, combine=combine):
-                    stream = iter([_reduce(combine, stream, zero)])
+                    stream = _reduce_lazy(stream, zero, combine)
                 case MapAsyncChunked(func=func, map_batch_size=batch_size):
                     stream = _iter_chunked_async(
                         stream, batch_size, _make_map_chunk_coro(func)
@@ -358,9 +392,7 @@ class LocalInterpreter(Interpreter):
                 case OnError(handler=handler):
                     stream = _on_error(stream, handler)
                 case SinkOp(sink=sink):
-                    for item in stream:
-                        sink.write(item)
-                    return iter(())
+                    stream = _to_sink(stream, sink)
                 case _:  # pragma: no cover
                     raise TypeError(f"Unknown operator: {op!r}")
         return stream

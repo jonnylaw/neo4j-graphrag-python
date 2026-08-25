@@ -45,6 +45,7 @@ Example — partial-failure safe pipeline::
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from typing import Any, Generic, TypeVar
 
@@ -321,7 +322,10 @@ class Pipeline(Generic[T]):
             sink: An object satisfying the
                 :class:`~neo4j_graphrag.pipeline.sink.Sink` protocol.
         """
-        LocalInterpreter().evaluate(self._wrap(ops.SinkOp(prev=self._tail, sink=sink)))
+        stream = LocalInterpreter().evaluate(
+            self._wrap(ops.SinkOp(prev=self._tail, sink=sink))
+        )
+        deque(stream, maxlen=0)  # drain: the writes happen as the stream is consumed
 
     def __iter__(self) -> Iterator[T]:
         return LocalInterpreter().evaluate(self)

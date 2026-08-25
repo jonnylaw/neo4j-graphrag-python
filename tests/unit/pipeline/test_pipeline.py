@@ -70,6 +70,11 @@ class _CaptureSink:
         self.received.append(element)
 
 
+def pipe_tail(pipe: Pipeline[int]) -> ops.Operator:
+    """The tail operator of *pipe*, for building a sink graph by hand."""
+    return pipe.pipeline_operators[-1]
+
+
 async def _double(x: int) -> int:
     return x * 2
 
@@ -373,6 +378,45 @@ class TestLaziness:
         assert calls == []  # nothing has run yet
         pipe.collect()
         assert calls == [1, 2, 3]  # runs on consumption
+
+    def test_evaluate_runs_nothing_before_the_stream_is_consumed(self) -> None:
+        """``evaluate()`` only builds the generator chain.
+
+        Every operator must defer its work, including the ones that drain
+        their whole upstream (``reduce``, ``to_sink``).
+        """
+        source = _CountingSource([1, 2, 3])
+        pipe = Pipeline.from_source(source).map(lambda x: x)
+        LocalInterpreter().evaluate(pipe)
+        assert source.reads == 0
+
+    def test_reduce_does_not_fold_until_consumed(self) -> None:
+        read: list[int] = []
+
+        def _tracked() -> Iterable[int]:
+            for i in [1, 2, 3]:
+                read.append(i)
+                yield i
+
+        pipe = Pipeline(_tracked()).reduce(zero=0, combine=lambda a, b: a + b)
+        stream = LocalInterpreter().evaluate(pipe)
+        assert read == []  # the fold has not touched the upstream yet
+        assert list(stream) == [6]
+        assert read == [1, 2, 3]
+
+    def test_sink_does_not_write_until_consumed(self) -> None:
+        sink = _CaptureSink()
+        base = Pipeline([1, 2, 3])
+        sink_graph = Pipeline._wrap(ops.SinkOp(prev=pipe_tail(base), sink=sink))
+        stream = LocalInterpreter().evaluate(sink_graph)
+        assert sink.received == []  # evaluate() alone writes nothing
+        assert list(stream) == []  # a sink stream yields nothing...
+        assert sink.received == [1, 2, 3]  # ...but writes as it drains
+
+    def test_to_sink_drains_the_stream(self) -> None:
+        sink = _CaptureSink()
+        Pipeline([1, 2, 3]).to_sink(sink)
+        assert sink.received == [1, 2, 3]
 
     def test_full_pipeline(self) -> None:
         result = (
