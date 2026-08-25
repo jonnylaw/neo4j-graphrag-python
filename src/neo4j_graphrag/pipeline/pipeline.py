@@ -302,6 +302,10 @@ class Pipeline(Generic[T]):
         """Evaluate the pipeline with the default interpreter, writing each
         element to *sink*.
 
+        An exception raised by ``sink.write`` propagates and aborts the run;
+        elements already written are not rolled back.  See
+        :class:`~neo4j_graphrag.pipeline.sink.Sink` for the rationale.
+
         Args:
             sink: An object satisfying the
                 :class:`~neo4j_graphrag.pipeline.sink.Sink` protocol.

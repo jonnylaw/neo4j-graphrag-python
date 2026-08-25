@@ -35,6 +35,14 @@ class Sink(Protocol[T_contra]):
     Implementors must provide a ``write`` method that accepts a single
     element of type ``T_contra`` and persists it to the backing store.
 
+    Failures are fatal by design: an exception raised by ``write`` is not
+    captured as an :class:`~neo4j_graphrag.pipeline.result.Err`, it
+    propagates out of :meth:`~neo4j_graphrag.pipeline.pipeline.Pipeline.to_sink`
+    and aborts the run.  Elements written before the failure stay written —
+    a sink is not transactional unless the implementation makes it so.  A
+    sink that should tolerate per-element failures must catch them itself,
+    e.g. by recording them and returning normally.
+
     Example::
 
         class InMemorySink:

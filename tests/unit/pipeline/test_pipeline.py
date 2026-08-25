@@ -71,6 +71,19 @@ class _CaptureSink:
         self.received.append(element)
 
 
+class _FailingSink:
+    """Records writes until it sees *fail_on*, then raises."""
+
+    def __init__(self, fail_on: int) -> None:
+        self.received: list[int] = []
+        self._fail_on = fail_on
+
+    def write(self, element: int) -> None:
+        if element == self._fail_on:
+            raise RuntimeError(f"write failed: {element}")
+        self.received.append(element)
+
+
 def pipe_tail(pipe: Pipeline[int]) -> ops.Operator:
     """The tail operator of *pipe*, for building a sink graph by hand."""
     return pipe.pipeline_operators[-1]
@@ -365,6 +378,44 @@ class TestToSink:
         sink = _CaptureSink()
         Pipeline([1, 2, 3]).map(lambda x: x * 2).to_sink(sink)
         assert sink.received == [2, 4, 6]
+
+    def test_write_failure_aborts_the_run(self) -> None:
+        """Sink failures are fatal — they are not captured as ``Err``."""
+        sink = _FailingSink(fail_on=2)
+        with pytest.raises(RuntimeError, match="write failed: 2"):
+            Pipeline([1, 2, 3]).to_sink(sink)
+
+    def test_elements_before_a_write_failure_stay_written(self) -> None:
+        sink = _FailingSink(fail_on=2)
+        with pytest.raises(RuntimeError):
+            Pipeline([1, 2, 3]).to_sink(sink)
+        assert sink.received == [1]
+
+    def test_write_failure_stops_reading_the_upstream(self) -> None:
+        """The failure must not drain the rest of the source first."""
+        seen: list[int] = []
+
+        def _record(x: int) -> int:
+            seen.append(x)
+            return x
+
+        with pytest.raises(RuntimeError):
+            Pipeline([1, 2, 3]).map(_record).to_sink(_FailingSink(fail_on=2))
+        assert seen == [1, 2]
+
+    def test_sink_after_chunked_async_stage(self) -> None:
+        sink = _CaptureSink()
+        Pipeline([1, 2, 3]).map_async_chunked(_double, map_batch_size=2).to_sink(sink)
+        assert sink.received == [2, 4, 6]
+
+    def test_sink_receives_result_values_when_errors_are_handled(self) -> None:
+        sink = _CaptureSink()
+        errors: list[Err] = []
+        Pipeline([1, 2, 3]).map_safe(_fail_on_two_sync).on_error(errors.append).to_sink(
+            sink
+        )
+        assert sink.received == [1, 3]
+        assert len(errors) == 1
 
 
 class TestLaziness:
