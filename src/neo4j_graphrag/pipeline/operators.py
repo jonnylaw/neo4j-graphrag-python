@@ -37,16 +37,11 @@ Node naming conventions:
   stream, passing ``Err`` items through unchanged.
 - ``*AsyncChunked`` nodes apply an async function concurrently in chunks
   of ``map_batch_size`` items.
-
-The only non-pure objects here are :class:`TeeState` and
-:class:`PartitionState`: runtime tokens shared between the branches created
-by ``tee`` / ``partition``.  They are created at build time and populated
-lazily by the interpreter on first evaluation.
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -78,11 +73,7 @@ __all__ = [
     "TryFlatMapOkAsyncChunked",
     "FilterOk",
     "OnError",
-    "TeeBranch",
-    "PartitionBranch",
     "SinkOp",
-    "TeeState",
-    "PartitionState",
 ]
 
 
@@ -279,54 +270,6 @@ class OnError(Operator):
     """Call ``handler`` for each ``Err``, drop it, and unwrap ``Ok`` values."""
 
     handler: Callable[[Err], None]
-
-
-# ---------------------------------------------------------------------------
-# Branching
-# ---------------------------------------------------------------------------
-
-
-class TeeState:
-    """Runtime token shared by the branches of a ``tee``.
-
-    Created when ``Pipeline.tee(n)`` is called.  On the first evaluation of
-    any branch, the interpreter populates ``iterators`` with
-    ``itertools.tee`` over the realised upstream stream; all branches then
-    share a single pass over the upstream, buffered lazily.
-    """
-
-    def __init__(self, n: int) -> None:
-        self.n = n
-        self.iterators: tuple[Iterator[Any], ...] | None = None
-
-
-class PartitionState:
-    """Runtime token shared by the two branches of a ``partition``.
-
-    On the first evaluation of either branch, the interpreter materialises
-    the upstream into ``ok_values`` / ``err_values`` so both branches can be
-    consumed independently.
-    """
-
-    def __init__(self) -> None:
-        self.ok_values: list[Any] | None = None
-        self.err_values: list[Err] | None = None
-
-
-@dataclass
-class TeeBranch(Operator):
-    """Marks this pipeline as branch ``index`` of a shared ``tee``."""
-
-    state: TeeState
-    index: int
-
-
-@dataclass
-class PartitionBranch(Operator):
-    """Marks this pipeline as the success or failure branch of a ``partition``."""
-
-    state: PartitionState
-    want_ok: bool
 
 
 # ---------------------------------------------------------------------------

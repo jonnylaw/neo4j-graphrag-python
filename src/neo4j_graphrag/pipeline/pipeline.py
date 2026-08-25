@@ -180,39 +180,6 @@ class Pipeline(Generic[T]):
         """Keep only elements for which *predicate* is ``True``."""
         return self._wrap(ops.Filter(prev=self._tail, predicate=predicate))
 
-    def tee(self, n: int = 2) -> tuple[Pipeline[T], ...]:
-        """Fork this stream into *n* independent, lazily-buffered copies.
-
-        Each returned :class:`Pipeline` sees every element exactly once, and
-        all branches share a single pass over the upstream
-        (``itertools.tee`` semantics): elements are buffered internally only
-        as far as the fastest consumer has advanced ahead of the slowest.
-
-        .. warning::
-            If the returned pipelines are consumed **sequentially** (one
-            fully before the other), every element is held in the internal
-            buffer until the last branch drains it — equivalent in memory
-            terms to :meth:`collect`.  Prefer this method when branches are
-            consumed in near-lockstep.
-
-        Args:
-            n: Number of independent copies to produce.  Must be >= 2.
-
-        Returns:
-            A tuple of *n* new :class:`Pipeline` instances sharing a single
-            pass over the upstream.
-
-        Raises:
-            ValueError: If *n* < 2.
-        """
-        if n < 2:
-            raise ValueError(f"n must be >= 2, got {n!r}")
-        state = ops.TeeState(n)
-        return tuple(
-            self._wrap(ops.TeeBranch(prev=self._tail, state=state, index=i))
-            for i in range(n)
-        )
-
     def grouped(self, size: int) -> Pipeline[list[T]]:
         """Collect elements into batches of up to *size* items.
 
@@ -496,27 +463,6 @@ class ResultPipeline(Generic[ResI]):
                 item, e.g. a logging callback or a failure counter.
         """
         return Pipeline._wrap(ops.OnError(prev=self._tail, handler=handler))
-
-    def partition(self) -> tuple[Pipeline[ResI], Pipeline[Err]]:
-        """Split the stream into a success branch and a failure branch.
-
-        Materialises the upstream on first evaluation so both branches can
-        be consumed independently without double-iteration.
-
-        Returns:
-            A tuple of ``(successes, failures)`` where *successes* is a
-            :class:`Pipeline` of unwrapped ``Ok`` values and *failures* is
-            a :class:`Pipeline` of ``Err`` values.
-        """
-        state = ops.PartitionState()
-        return (
-            Pipeline._wrap(
-                ops.PartitionBranch(prev=self._tail, state=state, want_ok=True)
-            ),
-            Pipeline._wrap(
-                ops.PartitionBranch(prev=self._tail, state=state, want_ok=False)
-            ),
-        )
 
     def collect(self) -> list[Ok[ResI] | Err]:
         """Evaluate the pipeline and materialise the raw ``Ok``/``Err``

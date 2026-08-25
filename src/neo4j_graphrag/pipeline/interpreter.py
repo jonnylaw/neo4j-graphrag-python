@@ -53,7 +53,6 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from neo4j_graphrag.pipeline.operators import (
     Filter,
     FilterOk,
-    Operator,
     FlatMap,
     FlatMapOk,
     Grouped,
@@ -61,15 +60,12 @@ from neo4j_graphrag.pipeline.operators import (
     MapAsyncChunked,
     MapOk,
     OnError,
-    PartitionBranch,
-    PartitionState,
     ReduceOp,
     SinkOp,
     Skip,
     SourceOp,
     Take,
     TakeWhile,
-    TeeBranch,
     TryFlatMap,
     TryFlatMapAsyncChunked,
     TryFlatMapOk,
@@ -289,29 +285,6 @@ def _on_error(stream: Iterator[Any], handler: Callable[[Err], None]) -> Iterator
             yield item.value
 
 
-def _partition(
-    stream: Iterator[Any], state: PartitionState, want_ok: bool
-) -> Iterator[Any]:
-    """Return the success or failure branch of a partition.
-
-    Materialises the upstream on first use so both branches can be consumed
-    independently without double-iteration.
-    """
-    if state.ok_values is None or state.err_values is None:
-        ok_values: list[Any] = []
-        err_values: list[Err] = []
-        for item in stream:
-            if isinstance(item, Ok):
-                ok_values.append(item.value)
-            else:
-                err_values.append(item)
-        state.ok_values = ok_values
-        state.err_values = err_values
-        return iter(ok_values if want_ok else err_values)
-    assert state.ok_values is not None and state.err_values is not None
-    return iter(state.ok_values if want_ok else state.err_values)
-
-
 # ---------------------------------------------------------------------------
 # Local interpreter
 # ---------------------------------------------------------------------------
@@ -321,18 +294,14 @@ class LocalInterpreter(Interpreter):
     """Evaluate a pipeline in the current process with lazy generators.
 
     Folds the operator list into a single generator chain.  Apart from
-    ``ReduceOp`` (which folds its upstream eagerly), ``PartitionBranch``
-    (which materialises its upstream) and the blocking chunked-async
-    operators, no work happens until the returned stream is consumed.
+    ``ReduceOp`` (which folds its upstream eagerly) and the blocking
+    chunked-async operators, no work happens until the returned stream is
+    consumed.
     """
 
     def evaluate(self, pipeline: Pipeline[Any] | ResultPipeline[Any]) -> Iterator[Any]:
-        operators = pipeline.pipeline_operators
-        start = self._resume_point(operators)
-        if start is None:
-            return iter(())
-        stream, start_index = start
-        for op in operators[start_index:]:
+        stream: Iterator[Any] = iter(())
+        for op in pipeline.pipeline_operators:
             match op:
                 case SourceOp(source=source):
                     stream = iter(source.read())
@@ -388,12 +357,6 @@ class LocalInterpreter(Interpreter):
                     stream = (item.value for item in stream if isinstance(item, Ok))
                 case OnError(handler=handler):
                     stream = _on_error(stream, handler)
-                case TeeBranch(state=state, index=index):
-                    if state.iterators is None:
-                        state.iterators = itertools.tee(stream, state.n)
-                    stream = state.iterators[index]
-                case PartitionBranch(state=state, want_ok=want_ok):
-                    stream = _partition(stream, state, want_ok)
                 case SinkOp(sink=sink):
                     for item in stream:
                         sink.write(item)
@@ -401,36 +364,3 @@ class LocalInterpreter(Interpreter):
                 case _:  # pragma: no cover
                     raise TypeError(f"Unknown operator: {op!r}")
         return stream
-
-    @staticmethod
-    def _resume_point(
-        operators: list[Operator],
-    ) -> tuple[Iterator[Any], int] | None:
-        """Find the latest already-initialised branch point, if any.
-
-        When evaluating one branch of a ``tee``/``partition`` *after*
-        another branch has already been (partially) evaluated, the shared
-        state token already holds the realised upstream.  Re-folding the
-        prefix would call ``source.read()`` again; instead, resume directly
-        from the shared state.
-
-        Returns ``(stream, start_index)`` — the stream to continue from and
-        the index of the first operator still to apply — or ``None`` if the
-        operator list is empty.
-        """
-        if not operators:
-            return None
-        stream: Iterator[Any] = iter(())
-        start_index = 0
-        for i, op in enumerate(operators):
-            if isinstance(op, TeeBranch) and op.state.iterators is not None:
-                stream = op.state.iterators[op.index]
-                start_index = i + 1
-            elif (
-                isinstance(op, PartitionBranch)
-                and op.state.ok_values is not None
-                and op.state.err_values is not None
-            ):
-                stream = iter(op.state.ok_values if op.want_ok else op.state.err_values)
-                start_index = i + 1
-        return stream, start_index

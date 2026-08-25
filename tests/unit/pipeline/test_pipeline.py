@@ -245,61 +245,6 @@ class TestFilter:
 
 
 # ---------------------------------------------------------------------------
-# tee
-# ---------------------------------------------------------------------------
-
-
-class TestTee:
-    def test_default_returns_two_branches(self) -> None:
-        branches = Pipeline([1, 2, 3]).tee()
-        assert len(branches) == 2
-
-    def test_each_branch_sees_all_elements(self) -> None:
-        b1, b2 = Pipeline([1, 2, 3]).tee()
-        assert b1.collect() == [1, 2, 3]
-        assert b2.collect() == [1, 2, 3]
-
-    def test_element_order_is_preserved_in_each_branch(self) -> None:
-        b1, b2 = Pipeline([3, 1, 2]).tee()
-        assert b1.collect() == [3, 1, 2]
-        assert b2.collect() == [3, 1, 2]
-
-    def test_branches_are_independent(self) -> None:
-        b1, b2 = Pipeline([1, 2, 3]).tee()
-        assert b1.map(lambda x: x * 10).collect() == [10, 20, 30]
-        assert b2.filter(lambda x: x % 2 == 1).collect() == [1, 3]
-
-    def test_n_controls_number_of_branches(self) -> None:
-        branches = Pipeline([1, 2]).tee(4)
-        assert len(branches) == 4
-        for b in branches:
-            assert b.collect() == [1, 2]
-
-    def test_empty_stream_produces_empty_branches(self) -> None:
-        b1, b2 = Pipeline[int]([]).tee()
-        assert b1.collect() == []
-        assert b2.collect() == []
-
-    def test_tee_after_map(self) -> None:
-        b1, b2 = Pipeline([1, 2]).map(lambda x: x * 5).tee()
-        assert b1.collect() == [5, 10]
-        assert b2.collect() == [5, 10]
-
-    def test_n_less_than_two_raises(self) -> None:
-        with pytest.raises(ValueError, match="n must be >= 2"):
-            Pipeline([1]).tee(1)
-
-    def test_upstream_is_read_once_across_branches(self) -> None:
-        """Evaluating a second branch resumes from shared tee state instead
-        of re-reading the source."""
-        source = _CountingSource([1, 2, 3])
-        b1, b2 = Pipeline.from_source(source).tee()
-        assert b1.collect() == [1, 2, 3]
-        assert b2.collect() == [1, 2, 3]
-        assert source.reads == 1
-
-
-# ---------------------------------------------------------------------------
 # grouped
 # ---------------------------------------------------------------------------
 
@@ -810,47 +755,6 @@ class TestOnError:
 
     def test_returns_pipeline(self) -> None:
         assert isinstance(_mixed_stream().on_error(lambda e: None), Pipeline)
-
-
-# ---------------------------------------------------------------------------
-# partition
-# ---------------------------------------------------------------------------
-
-
-class TestPartition:
-    def test_successes_contain_unwrapped_ok_values(self) -> None:
-        successes, _ = _mixed_stream().partition()
-        assert successes.collect() == [1, 3]
-
-    def test_failures_contain_err_values(self) -> None:
-        _, failures = _mixed_stream().partition()
-        errs = failures.collect()
-        assert len(errs) == 1
-        assert isinstance(errs[0], Err)
-
-    def test_branches_are_independent(self) -> None:
-        successes, failures = _mixed_stream().partition()
-        assert failures.collect()[0].exception.args == ("two",)
-        assert successes.collect() == [1, 3]
-
-    def test_all_ok_empty_failure_branch(self) -> None:
-        successes, failures = Pipeline([1]).map_safe(lambda x: x).partition()
-        assert successes.collect() == [1]
-        assert failures.collect() == []
-
-    def test_all_err_empty_success_branch(self) -> None:
-        successes, failures = Pipeline([2]).map_safe(_fail_on_two_sync).partition()
-        assert successes.collect() == []
-        assert len(failures.collect()) == 1
-
-    def test_upstream_is_read_once_across_branches(self) -> None:
-        source = _CountingSource([1, 2])
-        successes, failures = (
-            Pipeline.from_source(source).map_safe(_fail_on_two_sync).partition()
-        )
-        assert successes.collect() == [1]
-        assert len(failures.collect()) == 1
-        assert source.reads == 1
 
 
 # ---------------------------------------------------------------------------

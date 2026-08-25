@@ -20,9 +20,8 @@ Defines the two variants produced by ``_safe`` operators on
 * :class:`Ok` – a successful value wrapped in the result stream.
 * :class:`Err` – a captured exception that stays in the stream until
   explicitly handled via
-  :meth:`~neo4j_graphrag.pipeline.pipeline.ResultPipeline.on_error`,
-  :meth:`~neo4j_graphrag.pipeline.pipeline.ResultPipeline.filter_ok`, or
-  :meth:`~neo4j_graphrag.pipeline.pipeline.ResultPipeline.partition`.
+  :meth:`~neo4j_graphrag.pipeline.pipeline.ResultPipeline.on_error` or
+  :meth:`~neo4j_graphrag.pipeline.pipeline.ResultPipeline.filter_ok`.
 
 Having a shared :class:`Result` base class lets callers write
 ``isinstance(item, Result)`` guards and makes the contract visible in
