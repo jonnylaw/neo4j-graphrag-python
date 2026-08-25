@@ -53,8 +53,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from neo4j_graphrag.pipeline.operators import (
     Filter,
     FilterOk,
+    FlattenOk,
     FlatMap,
-    FlatMapOk,
     Grouped,
     Map,
     MapAsyncChunked,
@@ -66,10 +66,6 @@ from neo4j_graphrag.pipeline.operators import (
     SourceOp,
     Take,
     TakeWhile,
-    TryFlatMap,
-    TryFlatMapAsyncChunked,
-    TryFlatMapOk,
-    TryFlatMapOkAsyncChunked,
     TryMap,
     TryMapAsyncChunked,
     TryMapOk,
@@ -170,26 +166,6 @@ def _make_try_chunk_coro(
     return _run_chunk
 
 
-def _make_try_flat_chunk_coro(
-    func: Callable[[_T], Awaitable[Iterable[_U]]],
-) -> Callable[[list[_T]], Coroutine[None, None, list[Ok[_U] | Err]]]:
-    async def _run_chunk(chunk: list[_T]) -> list[Ok[_U] | Err]:
-        raw = await asyncio.gather(
-            *[func(item) for item in chunk], return_exceptions=True
-        )
-        results: list[Ok[_U] | Err] = []
-        for r in raw:
-            if isinstance(r, Exception):
-                results.append(Err(exception=r))
-            elif isinstance(r, BaseException):
-                raise r
-            else:
-                results.extend(Ok(value=v) for v in r)
-        return results
-
-    return _run_chunk
-
-
 def _make_try_ok_chunk_coro(
     func: Callable[[Any], Awaitable[Any]],
 ) -> Callable[[list[Any]], Coroutine[None, None, list[Any]]]:
@@ -207,36 +183,10 @@ def _make_try_ok_chunk_coro(
     return _run_chunk
 
 
-def _make_try_flat_ok_chunk_coro(
-    func: Callable[[Any], Awaitable[Iterable[Any]]],
-) -> Callable[[list[Any]], Coroutine[None, None, list[Any]]]:
-    async def _process(item: Ok[Any] | Err) -> list[Ok[Any] | Err]:
-        if isinstance(item, Err):
-            return [item]
-        try:
-            return [Ok(value=v) for v in await func(item.value)]
-        except Exception as e:
-            return [Err(exception=e)]
-
-    async def _run_chunk(chunk: list[Any]) -> list[Any]:
-        nested = await asyncio.gather(*[_process(item) for item in chunk])
-        return [result for sublist in nested for result in sublist]
-
-    return _run_chunk
-
-
 def _try_map(stream: Iterator[Any], func: Callable[[Any], Any]) -> Iterator[Any]:
     for item in stream:
         try:
             yield Ok(value=func(item))
-        except Exception as e:
-            yield Err(exception=e)
-
-
-def _try_flat_map(stream: Iterator[Any], func: Callable[[Any], Any]) -> Iterator[Any]:
-    for item in stream:
-        try:
-            yield from (Ok(value=v) for v in func(item))
         except Exception as e:
             yield Err(exception=e)
 
@@ -249,14 +199,6 @@ def _map_ok(stream: Iterator[Any], func: Callable[[Any], Any]) -> Iterator[Any]:
             yield Ok(value=func(item.value))
 
 
-def _flat_map_ok(stream: Iterator[Any], func: Callable[[Any], Any]) -> Iterator[Any]:
-    for item in stream:
-        if isinstance(item, Err):
-            yield item
-        else:
-            yield from (Ok(value=v) for v in func(item.value))
-
-
 def _try_map_ok(stream: Iterator[Any], func: Callable[[Any], Any]) -> Iterator[Any]:
     for item in stream:
         if isinstance(item, Err):
@@ -264,19 +206,6 @@ def _try_map_ok(stream: Iterator[Any], func: Callable[[Any], Any]) -> Iterator[A
         else:
             try:
                 yield Ok(value=func(item.value))
-            except Exception as e:
-                yield Err(exception=e)
-
-
-def _try_flat_map_ok(
-    stream: Iterator[Any], func: Callable[[Any], Any]
-) -> Iterator[Any]:
-    for item in stream:
-        if isinstance(item, Err):
-            yield item
-        else:
-            try:
-                yield from (Ok(value=v) for v in func(item.value))
             except Exception as e:
                 yield Err(exception=e)
 
@@ -307,6 +236,14 @@ def _to_sink(stream: Iterator[Any], sink: Sink[Any]) -> Iterator[Any]:
     for item in stream:
         sink.write(item)
     yield from ()
+
+
+def _flatten_ok(stream: Iterator[Any]) -> Iterator[Any]:
+    for item in stream:
+        if isinstance(item, Err):
+            yield item
+        else:
+            yield from (Ok(value=v) for v in item.value)
 
 
 def _on_error(stream: Iterator[Any], handler: Callable[[Err], None]) -> Iterator[Any]:
@@ -361,31 +298,19 @@ class LocalInterpreter(Interpreter):
                     )
                 case TryMap(func=func):
                     stream = _try_map(stream, func)
-                case TryFlatMap(func=func):
-                    stream = _try_flat_map(stream, func)
                 case TryMapAsyncChunked(func=func, map_batch_size=batch_size):
                     stream = _iter_chunked_async(
                         stream, batch_size, _make_try_chunk_coro(func)
                     )
-                case TryFlatMapAsyncChunked(func=func, map_batch_size=batch_size):
-                    stream = _iter_chunked_async(
-                        stream, batch_size, _make_try_flat_chunk_coro(func)
-                    )
                 case MapOk(func=func):
                     stream = _map_ok(stream, func)
-                case FlatMapOk(func=func):
-                    stream = _flat_map_ok(stream, func)
+                case FlattenOk():
+                    stream = _flatten_ok(stream)
                 case TryMapOk(func=func):
                     stream = _try_map_ok(stream, func)
-                case TryFlatMapOk(func=func):
-                    stream = _try_flat_map_ok(stream, func)
                 case TryMapOkAsyncChunked(func=func, map_batch_size=batch_size):
                     stream = _iter_chunked_async(
                         stream, batch_size, _make_try_ok_chunk_coro(func)
-                    )
-                case TryFlatMapOkAsyncChunked(func=func, map_batch_size=batch_size):
-                    stream = _iter_chunked_async(
-                        stream, batch_size, _make_try_flat_ok_chunk_coro(func)
                     )
                 case FilterOk():
                     stream = (item.value for item in stream if isinstance(item, Ok))

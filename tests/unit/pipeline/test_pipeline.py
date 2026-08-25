@@ -22,6 +22,7 @@ via ``asyncio.run()``, so no running event loop is present during the test.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Any
 
 import pytest
 
@@ -433,7 +434,7 @@ class TestLaziness:
 
 
 # ---------------------------------------------------------------------------
-# map_safe / flat_map_safe (Pipeline -> ResultPipeline)
+# map_safe (Pipeline -> ResultPipeline)
 # ---------------------------------------------------------------------------
 
 
@@ -469,16 +470,29 @@ class TestMapSafe:
         assert isinstance(Pipeline([1]).map_safe(lambda x: x), ResultPipeline)
 
 
-class TestFlatMapSafe:
-    def test_all_succeed_flattened_and_wrapped(self) -> None:
-        result = Pipeline([1, 2]).flat_map_safe(lambda x: [x, x * 10]).collect()
+# ---------------------------------------------------------------------------
+# flatten_ok — the 1-to-many stage for result streams
+# ---------------------------------------------------------------------------
+
+
+class TestFlattenOk:
+    def test_expands_each_ok_into_one_ok_per_item(self) -> None:
+        result = Pipeline([1, 2]).map_safe(lambda x: [x, x * 10]).flatten_ok().collect()
         assert result == [Ok(1), Ok(10), Ok(2), Ok(20)]
 
-    def test_exception_becomes_single_err(self) -> None:
+    def test_err_passes_through_at_original_position(self) -> None:
+        result = _mixed_stream().map_safe(lambda x: [x, x]).flatten_ok().collect()
+        assert result[0] == Ok(1)
+        assert result[1] == Ok(1)
+        assert isinstance(result[2], Err)
+        assert result[3] == Ok(3)
+        assert result[4] == Ok(3)
+
+    def test_upstream_exception_stays_a_single_err(self) -> None:
         def _boom(x: int) -> list[int]:
             raise ValueError("boom")
 
-        result = Pipeline([1]).flat_map_safe(_boom).collect()
+        result = Pipeline([1]).map_safe(_boom).flatten_ok().collect()
         assert len(result) == 1
         assert isinstance(result[0], Err)
 
@@ -486,12 +500,21 @@ class TestFlatMapSafe:
         def _empty(x: int) -> list[int]:
             return []
 
-        result = Pipeline([1, 2]).flat_map_safe(_empty).collect()
-        assert result == []
+        assert Pipeline([1, 2]).map_safe(_empty).flatten_ok().collect() == []
+
+    def test_non_iterable_ok_propagates(self) -> None:
+        """flatten_ok is not error-capturing — see its docstring.
+
+        The upstream is deliberately untyped here: ``flatten_ok`` requires
+        a stream of iterables, so this misuse is a type error by design.
+        """
+        not_iterables: ResultPipeline[Any] = Pipeline([1]).map_safe(lambda x: x)
+        with pytest.raises(TypeError):
+            not_iterables.flatten_ok().collect()
 
 
 # ---------------------------------------------------------------------------
-# map_async_chunked_safe / flat_map_async_chunked_safe
+# map_async_chunked_safe
 # ---------------------------------------------------------------------------
 
 
@@ -530,10 +553,12 @@ class TestMapAsyncChunkedSafe:
             Pipeline([1]).map_async_chunked_safe(_interrupt).collect()
 
 
-class TestFlatMapAsyncChunkedSafe:
+class TestAsyncChunkedSafeThenFlattenOk:
+    """The async 1-to-many stage: map_async_chunked_safe + flatten_ok."""
+
     def test_all_succeed_flattened_and_wrapped(self) -> None:
-        result = Pipeline([1, 2]).flat_map_async_chunked_safe(_duplicate).collect()
-        assert result == [Ok(1), Ok(10), Ok(2), Ok(20)]
+        result = Pipeline([1, 2]).map_async_chunked_safe(_duplicate).flatten_ok()
+        assert result.collect() == [Ok(1), Ok(10), Ok(2), Ok(20)]
 
     def test_partial_failure_yields_single_err(self) -> None:
         async def _fail_on_two(x: int) -> list[int]:
@@ -541,7 +566,12 @@ class TestFlatMapAsyncChunkedSafe:
                 raise ValueError("two")
             return [x]
 
-        result = Pipeline([1, 2, 3]).flat_map_async_chunked_safe(_fail_on_two).collect()
+        result = (
+            Pipeline([1, 2, 3])
+            .map_async_chunked_safe(_fail_on_two)
+            .flatten_ok()
+            .collect()
+        )
         assert result[0] == Ok(1)
         assert isinstance(result[1], Err)
         assert result[2] == Ok(3)
@@ -550,15 +580,13 @@ class TestFlatMapAsyncChunkedSafe:
         async def _nothing(x: int) -> list[int]:
             return []
 
-        assert Pipeline([1]).flat_map_async_chunked_safe(_nothing).collect() == []
-
-    def test_invalid_batch_size_raises(self) -> None:
-        with pytest.raises(ValueError, match="map_batch_size must be >= 1"):
-            Pipeline([1]).flat_map_async_chunked_safe(_duplicate, map_batch_size=0)
+        assert (
+            Pipeline([1]).map_async_chunked_safe(_nothing).flatten_ok().collect() == []
+        )
 
 
 # ---------------------------------------------------------------------------
-# ResultPipeline combinators: map_ok / flat_map_ok
+# ResultPipeline combinators: map_ok
 # ---------------------------------------------------------------------------
 
 
@@ -586,12 +614,16 @@ class TestMapOk:
         assert result[2] == Ok(30)
 
     def test_err_passes_through_at_original_position(self) -> None:
-        result = _mixed_stream().flat_map_ok(lambda x: [x, x]).collect()
+        result = _mixed_stream().map_ok(lambda x: x * 10).collect()
+        assert result[0] == Ok(10)
+        assert isinstance(result[1], Err)
+        assert result[2] == Ok(30)
+
+    def test_expands_via_flatten_ok(self) -> None:
+        result = _mixed_stream().map_ok(lambda x: [x, x]).flatten_ok().collect()
         assert result[0] == Ok(1)
         assert result[1] == Ok(1)
         assert isinstance(result[2], Err)
-        assert result[3] == Ok(3)
-        assert result[4] == Ok(3)
 
     def test_exception_propagates(self) -> None:
         def _boom(x: int) -> int:
@@ -605,7 +637,7 @@ class TestMapOk:
 
 
 # ---------------------------------------------------------------------------
-# ResultPipeline combinators: map_safe / flat_map_safe
+# ResultPipeline combinators: map_safe
 # ---------------------------------------------------------------------------
 
 
@@ -653,31 +685,6 @@ def _fail_on_four_sync(x: int) -> int:
     return x
 
 
-class TestResultFlatMapSafe:
-    def test_ok_values_are_flattened(self) -> None:
-        result = (
-            Pipeline([1, 2])
-            .map_safe(lambda x: x)
-            .flat_map_safe(lambda x: [x, x * 10])
-            .collect()
-        )
-        assert result == [Ok(1), Ok(10), Ok(2), Ok(20)]
-
-    def test_existing_err_passes_through(self) -> None:
-        result = _mixed_stream().flat_map_safe(lambda x: [x]).collect()
-        assert result[0] == Ok(1)
-        assert isinstance(result[1], Err)
-        assert result[2] == Ok(3)
-
-    def test_exception_in_func_becomes_single_err(self) -> None:
-        def _boom(x: int) -> list[int]:
-            raise ValueError("boom")
-
-        result = Pipeline([1]).map_safe(lambda x: x).flat_map_safe(_boom).collect()
-        assert len(result) == 1
-        assert isinstance(result[0], Err)
-
-
 # ---------------------------------------------------------------------------
 # ResultPipeline async combinators
 # ---------------------------------------------------------------------------
@@ -723,42 +730,26 @@ class TestResultMapAsyncChunkedSafe:
             )
 
 
-class TestResultFlatMapAsyncChunkedSafe:
+class TestResultAsyncChunkedSafeThenFlattenOk:
     def test_ok_values_are_expanded(self) -> None:
         result = (
             Pipeline([1, 2])
             .map_safe(lambda x: x)
-            .flat_map_async_chunked_safe(_duplicate)
+            .map_async_chunked_safe(_duplicate)
+            .flatten_ok()
             .collect()
         )
         assert result == [Ok(1), Ok(10), Ok(2), Ok(20)]
 
     def test_existing_err_passes_through(self) -> None:
-        result = _mixed_stream().flat_map_async_chunked_safe(_duplicate).collect()
+        result = (
+            _mixed_stream().map_async_chunked_safe(_duplicate).flatten_ok().collect()
+        )
         assert result[0] == Ok(1)
         assert result[1] == Ok(10)
         assert isinstance(result[2], Err)
         assert result[3] == Ok(3)
         assert result[4] == Ok(30)
-
-    def test_func_exception_becomes_err(self) -> None:
-        async def _boom(x: int) -> list[int]:
-            raise ValueError("boom")
-
-        result = (
-            Pipeline([1])
-            .map_safe(lambda x: x)
-            .flat_map_async_chunked_safe(_boom)
-            .collect()
-        )
-        assert len(result) == 1
-        assert isinstance(result[0], Err)
-
-    def test_invalid_batch_size_raises(self) -> None:
-        with pytest.raises(ValueError, match="map_batch_size must be >= 1"):
-            Pipeline([1]).map_safe(lambda x: x).flat_map_async_chunked_safe(
-                _duplicate, map_batch_size=0
-            )
 
 
 # ---------------------------------------------------------------------------

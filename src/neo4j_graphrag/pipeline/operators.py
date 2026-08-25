@@ -62,15 +62,11 @@ __all__ = [
     "ReduceOp",
     "MapAsyncChunked",
     "TryMap",
-    "TryFlatMap",
     "TryMapAsyncChunked",
-    "TryFlatMapAsyncChunked",
     "MapOk",
-    "FlatMapOk",
+    "FlattenOk",
     "TryMapOk",
-    "TryFlatMapOk",
     "TryMapOkAsyncChunked",
-    "TryFlatMapOkAsyncChunked",
     "FilterOk",
     "OnError",
     "SinkOp",
@@ -184,25 +180,10 @@ class TryMap(Operator):
 
 
 @dataclass
-class TryFlatMap(Operator):
-    """Like :class:`FlatMap`, but per-item exceptions become ``Err`` values."""
-
-    func: Callable[[Any], Iterable[Any]]
-
-
-@dataclass
 class TryMapAsyncChunked(Operator):
     """Like :class:`MapAsyncChunked`, capturing per-item exceptions as ``Err``."""
 
     func: Callable[[Any], Awaitable[Any]]
-    map_batch_size: int
-
-
-@dataclass
-class TryFlatMapAsyncChunked(Operator):
-    """Async chunked flat-mapping, capturing per-item exceptions as ``Err``."""
-
-    func: Callable[[Any], Awaitable[Iterable[Any]]]
     map_batch_size: int
 
 
@@ -219,10 +200,8 @@ class MapOk(Operator):
 
 
 @dataclass
-class FlatMapOk(Operator):
-    """Apply and flatten ``func`` on each ``Ok``; ``Err`` passes through."""
-
-    func: Callable[[Any], Iterable[Any]]
+class FlattenOk(Operator):
+    """Expand each ``Ok`` holding an iterable into one ``Ok`` per item."""
 
 
 @dataclass
@@ -233,25 +212,10 @@ class TryMapOk(Operator):
 
 
 @dataclass
-class TryFlatMapOk(Operator):
-    """Like :class:`FlatMapOk`, but new exceptions are captured as ``Err``."""
-
-    func: Callable[[Any], Iterable[Any]]
-
-
-@dataclass
 class TryMapOkAsyncChunked(Operator):
     """Async chunked mapping of ``Ok`` values; ``Err`` passes through."""
 
     func: Callable[[Any], Awaitable[Any]]
-    map_batch_size: int
-
-
-@dataclass
-class TryFlatMapOkAsyncChunked(Operator):
-    """Async chunked flat-mapping of ``Ok`` values; ``Err`` passes through."""
-
-    func: Callable[[Any], Awaitable[Iterable[Any]]]
     map_batch_size: int
 
 

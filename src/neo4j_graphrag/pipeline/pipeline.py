@@ -27,6 +27,20 @@ Because the definition is data, it can also be inspected, validated, or
 rendered without executing it, and alternative interpreters (async,
 multiprocessing, …) can evaluate the same definition differently.
 
+Method names compose from three independent suffixes:
+
+``_safe``
+    Capture per-item exceptions as :class:`~neo4j_graphrag.pipeline.result.Err`
+    instead of aborting the stream.  Returns a :class:`ResultPipeline`.
+``_ok``
+    Operate on the value inside each ``Ok``, passing ``Err`` through
+    untouched.  Only available on :class:`ResultPipeline`.
+``_async_chunked``
+    Apply an async function to ``map_batch_size`` items concurrently.
+
+1-to-many stages are *not* a fourth suffix: use a ``map`` variant followed
+by :meth:`Pipeline.flat_map` or :meth:`ResultPipeline.flatten_ok`.
+
 Example — partial-failure safe pipeline::
 
     from neo4j_graphrag.pipeline import Err, Pipeline
@@ -36,7 +50,7 @@ Example — partial-failure safe pipeline::
         Pipeline.from_source(source)
         .map_async_chunked_safe(load)      # ResultPipeline[Bytes]
         .map_ok(parse)                     # ResultPipeline[Doc]
-        .flat_map_ok(split)                # ResultPipeline[Chunk]
+        .map_ok(split).flatten_ok()        # ResultPipeline[Chunk]
         .map_async_chunked_safe(embed)     # ResultPipeline[EmbeddedChunk]
         .on_error(errors.append)           # Pipeline[EmbeddedChunk]
         .collect()
@@ -61,7 +75,7 @@ T = TypeVar("T")
 S = TypeVar("S")
 U = TypeVar("U")
 A = TypeVar("A")
-ResI = TypeVar("ResI")
+ResI = TypeVar("ResI", covariant=True)
 OutO = TypeVar("OutO")
 
 
@@ -250,15 +264,6 @@ class Pipeline(Generic[T]):
         """
         return ResultPipeline._wrap(ops.TryMap(prev=self._tail, func=func))
 
-    def flat_map_safe(self, func: Callable[[T], Iterable[U]]) -> ResultPipeline[U]:
-        """Apply *func* and flatten one level, capturing exceptions as ``Err``.
-
-        If *func* raises for a given item the exception is yielded as a
-        single ``Err`` and the stream continues with the next item.
-        Successful items are flattened and individually wrapped in ``Ok``.
-        """
-        return ResultPipeline._wrap(ops.TryFlatMap(prev=self._tail, func=func))
-
     def map_async_chunked_safe(
         self,
         func: Callable[[T], Awaitable[U]],
@@ -276,27 +281,6 @@ class Pipeline(Generic[T]):
         _validate_batch_size(map_batch_size)
         return ResultPipeline._wrap(
             ops.TryMapAsyncChunked(
-                prev=self._tail, func=func, map_batch_size=map_batch_size
-            )
-        )
-
-    def flat_map_async_chunked_safe(
-        self,
-        func: Callable[[T], Awaitable[Iterable[U]]],
-        map_batch_size: int = 100,
-    ) -> ResultPipeline[U]:
-        """Like :meth:`map_async_chunked_safe` but *func* returns an iterable
-        that is flattened into the result stream.
-
-        For each successful call the yielded values are individually wrapped
-        in ``Ok``; exceptions become a single ``Err``.
-
-        Raises:
-            ValueError: If *map_batch_size* < 1.
-        """
-        _validate_batch_size(map_batch_size)
-        return ResultPipeline._wrap(
-            ops.TryFlatMapAsyncChunked(
                 prev=self._tail, func=func, map_batch_size=map_batch_size
             )
         )
@@ -381,12 +365,24 @@ class ResultPipeline(Generic[ResI]):
         """
         return self._wrap(ops.MapOk(prev=self._tail, func=func))
 
-    def flat_map_ok(
-        self, func: Callable[[ResI], Iterable[OutO]]
-    ) -> ResultPipeline[OutO]:
-        """Apply *func* to each ``Ok`` value and flatten one level;
-        ``Err`` passes through."""
-        return self._wrap(ops.FlatMapOk(prev=self._tail, func=func))
+    def flatten_ok(self: ResultPipeline[Iterable[OutO]]) -> ResultPipeline[OutO]:
+        """Expand each ``Ok`` holding an iterable into one ``Ok`` per item;
+        ``Err`` passes through unchanged.
+
+        This is how the DSL expresses 1-to-many stages on a result stream:
+        pair it with whichever ``map`` variant has the error semantics you
+        want, instead of a dedicated ``flat_map`` for each combination::
+
+            .map_ok(split).flatten_ok()                 # split must not fail
+            .map_safe(split).flatten_ok()               # capture failures
+            .map_async_chunked_safe(split).flatten_ok()  # async, capture
+
+        The expansion itself is not error-capturing: if a value turns out
+        not to be iterable, or a lazy iterable raises while being consumed,
+        that exception propagates.  Return a materialised sequence from the
+        preceding ``map_safe`` if you need those failures as ``Err``.
+        """
+        return self._wrap(ops.FlattenOk(prev=self._tail))
 
     def map_safe(self, func: Callable[[ResI], OutO]) -> ResultPipeline[OutO]:
         """Apply *func* to each ``Ok`` value, capturing exceptions as ``Err``;
@@ -397,13 +393,6 @@ class ResultPipeline(Generic[ResI]):
         processing remaining items.
         """
         return self._wrap(ops.TryMapOk(prev=self._tail, func=func))
-
-    def flat_map_safe(
-        self, func: Callable[[ResI], Iterable[OutO]]
-    ) -> ResultPipeline[OutO]:
-        """Apply *func* to each ``Ok`` value and flatten one level, capturing
-        exceptions as ``Err``; existing ``Err`` values pass through unchanged."""
-        return self._wrap(ops.TryFlatMapOk(prev=self._tail, func=func))
 
     def map_async_chunked_safe(
         self,
@@ -420,25 +409,6 @@ class ResultPipeline(Generic[ResI]):
         _validate_batch_size(map_batch_size)
         return self._wrap(
             ops.TryMapOkAsyncChunked(
-                prev=self._tail, func=func, map_batch_size=map_batch_size
-            )
-        )
-
-    def flat_map_async_chunked_safe(
-        self,
-        func: Callable[[ResI], Awaitable[Iterable[OutO]]],
-        map_batch_size: int = 100,
-    ) -> ResultPipeline[OutO]:
-        """Apply async *func* to each ``Ok`` value in concurrent chunks,
-        flattening the returned iterable; existing ``Err`` values pass
-        through unchanged and new exceptions are captured as ``Err``.
-
-        Raises:
-            ValueError: If *map_batch_size* < 1.
-        """
-        _validate_batch_size(map_batch_size)
-        return self._wrap(
-            ops.TryFlatMapOkAsyncChunked(
                 prev=self._tail, func=func, map_batch_size=map_batch_size
             )
         )
