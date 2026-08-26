@@ -2,6 +2,8 @@
 
 ## Next
 
+## 1.19.0
+
 ### Added
 
 - Added `examples/SETUP.md` and `examples/.env.example`, documenting what the examples need in order to run — extras, API keys and services — and which providers are free or have a local equivalent.
