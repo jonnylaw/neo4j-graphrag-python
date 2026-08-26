@@ -94,8 +94,8 @@ def _validate_batch_size(map_batch_size: int) -> None:
         raise ValueError(f"map_batch_size must be >= 1, got {map_batch_size!r}")
 
 
-class _IterableSource:
-    """Adapter wrapping any ``Iterable`` to satisfy the ``Source`` protocol."""
+class _IterableSource(Source[Any]):
+    """Adapter wrapping any ``Iterable`` as a :class:`Source`."""
 
     def __init__(self, iterable: Iterable[Any]) -> None:
         self._iterable = iterable
@@ -127,8 +127,8 @@ class Pipeline(Generic[T]):
         """Create a pipeline whose elements come from *source*.
 
         Args:
-            source: Any object satisfying the
-                :class:`~neo4j_graphrag.pipeline.source.Source` protocol.
+            source: A :class:`~neo4j_graphrag.pipeline.source.Source`
+                implementation.
 
         Returns:
             A new :class:`Pipeline` typed to the element type of *source*.
@@ -317,8 +317,8 @@ class Pipeline(Generic[T]):
         :class:`~neo4j_graphrag.pipeline.sink.Sink` for the rationale.
 
         Args:
-            sink: An object satisfying the
-                :class:`~neo4j_graphrag.pipeline.sink.Sink` protocol.
+            sink: A :class:`~neo4j_graphrag.pipeline.sink.Sink`
+                implementation.
         """
         stream = LocalInterpreter().evaluate(
             self._wrap(ops.SinkOp(prev=self._tail, sink=sink))

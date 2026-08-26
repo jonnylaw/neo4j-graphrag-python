@@ -43,7 +43,7 @@ from neo4j_graphrag.pipeline import operators as ops
 # ---------------------------------------------------------------------------
 
 
-class _InMemorySource:
+class _InMemorySource(Source[int]):
     def __init__(self, items: list[int]) -> None:
         self._items = items
 
@@ -51,7 +51,7 @@ class _InMemorySource:
         return iter(self._items)
 
 
-class _CountingSource:
+class _CountingSource(Source[int]):
     """Records how many times read() is called."""
 
     def __init__(self, items: list[int]) -> None:
@@ -63,7 +63,7 @@ class _CountingSource:
         return iter(self._items)
 
 
-class _CaptureSink:
+class _CaptureSink(Sink[int]):
     def __init__(self) -> None:
         self.received: list[int] = []
 
@@ -71,7 +71,7 @@ class _CaptureSink:
         self.received.append(element)
 
 
-class _FailingSink:
+class _FailingSink(Sink[int]):
     """Records writes until it sees *fail_on*, then raises."""
 
     def __init__(self, fail_on: int) -> None:
@@ -116,8 +116,12 @@ class TestConstruction:
     def test_empty_source_produces_empty_stream(self) -> None:
         assert Pipeline.from_source(_InMemorySource([])).collect() == []
 
-    def test_source_protocol_satisfied(self) -> None:
+    def test_source_subclass_satisfied(self) -> None:
         assert isinstance(_InMemorySource([1]), Source)
+
+    def test_source_is_abstract(self) -> None:
+        with pytest.raises(TypeError):
+            Source()  # type: ignore[abstract]
 
     def test_wraps_iterable_directly(self) -> None:
         assert Pipeline([1, 2, 3]).collect() == [1, 2, 3]
@@ -371,8 +375,12 @@ class TestToSink:
         Pipeline([]).to_sink(sink)
         assert sink.received == []
 
-    def test_sink_protocol_satisfied(self) -> None:
+    def test_sink_subclass_satisfied(self) -> None:
         assert isinstance(_CaptureSink(), Sink)
+
+    def test_sink_is_abstract(self) -> None:
+        with pytest.raises(TypeError):
+            Sink()  # type: ignore[abstract]
 
     def test_chained_operators_apply_before_sink(self) -> None:
         sink = _CaptureSink()

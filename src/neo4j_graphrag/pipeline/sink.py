@@ -12,27 +12,27 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-"""Sink protocol for the pipeline DSL.
+"""Sink abstract base class for the pipeline DSL.
 
 A ``Sink`` is the terminal destination for pipeline output (e.g. a file or
-a Neo4j database).  Any object implementing ``write(element)`` satisfies
-the protocol — no inheritance is required.
+a Neo4j database).  Implementations must subclass :class:`Sink` and
+implement :meth:`Sink.write`.
 """
 
 from __future__ import annotations
 
-from typing import Protocol, TypeVar, runtime_checkable
+from abc import ABC, abstractmethod
+from typing import Generic, TypeVar
 
 __all__ = ["Sink"]
 
 T_contra = TypeVar("T_contra", contravariant=True)
 
 
-@runtime_checkable
-class Sink(Protocol[T_contra]):
-    """Protocol satisfied by any object that can receive pipeline elements.
+class Sink(ABC, Generic[T_contra]):
+    """Abstract base class for objects that can receive pipeline elements.
 
-    Implementors must provide a ``write`` method that accepts a single
+    Subclasses must implement :meth:`write`, which accepts a single
     element of type ``T_contra`` and persists it to the backing store.
 
     Failures are fatal by design: an exception raised by ``write`` is not
@@ -45,7 +45,7 @@ class Sink(Protocol[T_contra]):
 
     Example::
 
-        class InMemorySink:
+        class InMemorySink(Sink[Any]):
             def __init__(self) -> None:
                 self.received: list[Any] = []
 
@@ -53,6 +53,7 @@ class Sink(Protocol[T_contra]):
                 self.received.append(element)
     """
 
+    @abstractmethod
     def write(self, element: T_contra) -> None:
         """Write a single *element* to the backing store."""
         ...

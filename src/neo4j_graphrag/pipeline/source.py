@@ -12,11 +12,11 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-"""Source protocol for the pipeline DSL.
+"""Source abstract base class for the pipeline DSL.
 
 A ``Source`` is the entry point for pipeline data (e.g. a Neo4j query, a
-file glob, or an in-memory sequence for testing).  Any object implementing
-``read()`` satisfies the protocol — no inheritance is required.
+file glob, or an in-memory sequence for testing).  Implementations must
+subclass :class:`Source` and implement :meth:`Source.read`.
 
 Variance note
 -------------
@@ -29,19 +29,19 @@ and is the dual of the contravariant
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Generic, TypeVar
 
 __all__ = ["Source"]
 
 T_co = TypeVar("T_co", covariant=True)
 
 
-@runtime_checkable
-class Source(Protocol[T_co]):
-    """Protocol satisfied by any object that can emit pipeline elements.
+class Source(ABC, Generic[T_co]):
+    """Abstract base class for objects that can emit pipeline elements.
 
-    Implementors must provide a ``read`` method that returns an iterable of
+    Subclasses must implement :meth:`read`, which returns an iterable of
     elements.  ``read`` is called each time the pipeline is evaluated, so
     sources that can only be consumed once (e.g. wrapping a generator)
     produce single-use pipelines.
@@ -51,7 +51,7 @@ class Source(Protocol[T_co]):
 
     Example::
 
-        class InMemorySource:
+        class InMemorySource(Source[int]):
             def __init__(self, items: list[int]) -> None:
                 self._items = items
 
@@ -59,6 +59,7 @@ class Source(Protocol[T_co]):
                 return list(self._items)
     """
 
+    @abstractmethod
     def read(self) -> Iterable[T_co]:
         """Return an iterable of elements to feed into the pipeline."""
         ...
