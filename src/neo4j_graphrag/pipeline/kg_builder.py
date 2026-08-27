@@ -17,38 +17,70 @@
 This is the dataflow-native counterpart of
 :class:`neo4j_graphrag.experimental.pipeline.kg_builder.SimpleKGPipeline`.
 Instead of a DAG of components executed by an orchestrator, documents flow
-from a :class:`~neo4j_graphrag.pipeline.source.Source` through one unbroken
-operator chain into a :class:`~neo4j_graphrag.pipeline.sink.Sink`::
+from a :class:`~neo4j_graphrag.pipeline.source.Source` through one operator
+chain into a :class:`~neo4j_graphrag.pipeline.sink.Sink`::
 
     Source[FsspecFile]
       → load            file            → LoadedDocument
       → resolve_schema  document        → document + GraphSchema
-      → split           document        → chunks                 (1-to-many)
-      → embed           chunk           → chunk + embedding
-      → lexical graph   chunk           → lexical graph
-      → extract         chunk           → lexical + entity graph
-      → prune           chunk graph     → schema-conformant graph
-      → link            chunk graph     → graph with NEXT_CHUNK
-      → reduce          chunk graphs    → one merged graph
+      → split           document        → chunks
+      → embed           document        → chunks + embeddings
+      → prepare         document        → [lexical graph, chunk, chunk, …]
+      → extract         chunk           → entity graph (with FROM_CHUNK edges)
+      → reduce          per document    → merged lexical + entity graph
+      → prune           document graph  → schema-conformant graph
       → Sink[Neo4jGraph]
 
-Every stage is chunk-scoped, including lexical graph construction: each
-chunk carries the uid of its predecessor, so the ``NEXT_CHUNK`` relationship
-is reconstructed per chunk instead of requiring the whole document to be
-materialised first. The only aggregation is the terminal ``reduce``, which
-merges every chunk graph into a single graph before one write — so peak
-memory is bounded by the size of the resulting knowledge graph.
+**Decision — lexical per-document, extraction per-chunk.** The two are
+decoupled, not fused:
 
-Per-chunk failures (embed, lexical graph, extract, prune) are captured as
-:class:`~neo4j_graphrag.pipeline.result.Err` values when ``on_error="IGNORE"``
-instead of aborting the run; load, schema and split failures are always fatal.
+* The lexical graph (Document and Chunk nodes, ``FROM_DOCUMENT``, and the
+  unbroken ``NEXT_CHUNK`` chain) is built once per document in a
+  *non-failable* stage by
+  :meth:`~neo4j_graphrag.components.lexical_graph.LexicalGraphBuilder.run`.
+  It makes no LLM calls, so a failure there is a bug and is fatal.
+
+* Entity extraction runs *per chunk* through
+  :meth:`~neo4j_graphrag.components.entity_relation_extractor.LLMEntityRelationExtractor.extract_chunk`
+  — a lexical-agnostic method that extracts entities and scopes their ids,
+  and does no lexical-graph work. A chunk that fails extraction yields an
+  ``Err`` for that chunk only; its Chunk node and every ``NEXT_CHUNK`` edge
+  were already committed to the lexical graph, so neither is orphaned or
+  severed by the failure. This is the granularity a transient LLM failure
+  (rate limit, network) needs: one chunk fails, the rest of the document
+  survives.
+
+The terminal ``reduce`` re-groups the extracted chunks back under their
+document and merges each into that document's lexical graph, so the sink
+sees one graph per document. (The DSL is single-stream and has no
+``join`` primitive, so the "one lexical graph + N chunk extractions" shape
+is expressed as a small tagged union of
+:class:`_LexicalPart` / :class:`_ChunkPart` elements; see ``_extract_part``.)
+
+Per-chunk extraction failures (and per-document embed/prepare/prune
+failures) are captured as :class:`~neo4j_graphrag.pipeline.result.Err`
+values when ``on_error="IGNORE"``; load, schema and split failures are
+always fatal.
+
+.. warning::
+
+    The default :class:`~neo4j_graphrag.pipeline.interpreter.LocalInterpreter`
+    evaluates async stages by running each batch of ``map_batch_size`` items
+    through a fresh ``asyncio.run()`` call. An async SDK client that pools
+    keep-alive connections (``httpx.AsyncClient``, ``aiohttp.ClientSession``)
+    and is shared across batches — i.e. created *outside* the async stage
+    functions — will then ``aclose()`` on a closed event loop and raise
+    ``RuntimeError: Event loop is closed``. Pass a client configured to
+    disable keep-alive (``httpx.AsyncClient(limits=httpx.Limits(max_keepalive_connections=0))``),
+    or construct the client inside the stage. A future async interpreter
+    would lift this restriction.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Optional, Union
 
@@ -84,7 +116,6 @@ from neo4j_graphrag.components.types import (
     LexicalGraphConfig,
     LoadedDocument,
     Neo4jGraph,
-    Neo4jRelationship,
     ResolutionStats,
     TextChunk,
     TextChunks,
@@ -104,6 +135,8 @@ logger = logging.getLogger(__name__)
 __all__ = ["SimpleKGPipeline", "SimpleKGPipelineResult"]
 
 SUPPORTED_EXTENSIONS = (".pdf", ".md", ".markdown")
+
+_SCHEMA_LITERALS = ("FREE", "EXTRACTED")
 
 
 class _DefaultDataLoader(DataLoader):
@@ -137,78 +170,72 @@ class _Document:
 
 
 @dataclass(frozen=True)
-class _Chunk:
-    """One chunk, carrying everything its downstream stages need.
+class _ChunkedDocument:
+    """A document's chunks, carrying everything downstream stages need."""
 
-    ``previous_chunk_uid`` is what lets the lexical graph be built one chunk
-    at a time: the ``NEXT_CHUNK`` relationship is rebuilt from it rather than
-    from a materialised list of sibling chunks.
-    """
-
-    chunk: TextChunk
     document_info: DocumentInfo
     schema: GraphSchema
-    previous_chunk_uid: Optional[str]
+    chunks: TextChunks
 
 
 @dataclass(frozen=True)
-class _LexicalChunkGraph:
-    """A chunk's lexical graph, before entity extraction.
+class _LexicalPart:
+    """The lexical graph of one document, built up front (non-failable).
 
-    Carries the chunk itself so the extraction stage can run on it.
+    Emitted as a single part per document ahead of its chunks, so it reaches
+    the merge regardless of how many of the document's chunks fail.
     """
 
-    lexical_graph: Neo4jGraph
-    chunk: TextChunk
+    doc_id: str
     schema: GraphSchema
-    previous_chunk_uid: Optional[str]
+    graph: Neo4jGraph
 
 
 @dataclass(frozen=True)
-class _ChunkGraph:
-    """The graph extracted from a single chunk, before it is linked up."""
+class _ChunkPart:
+    """One chunk of a document, destined for (failable) entity extraction."""
 
-    graph: Neo4jGraph
-    chunk_uid: str
+    doc_id: str
     schema: GraphSchema
-    previous_chunk_uid: Optional[str]
+    chunk: TextChunk
+
+
+@dataclass(frozen=True)
+class _GraphPart:
+    """A part that has yielded a graph: the lexical graph, or one chunk's
+    entity graph. Carries its document id so the terminal reduce can group
+    chunks back under their document."""
+
+    doc_id: str
+    schema: GraphSchema
+    graph: Neo4jGraph
 
 
 @dataclass
-class _GraphAccumulator:
-    """Accumulator for the terminal reduce: the merged graph plus the set of
-    node ids already in it.
+class _DocAccumulator:
+    """Accumulator for one document during the terminal merge."""
 
-    Every chunk graph repeats its Document node so that its ``FROM_DOCUMENT``
-    edge survives pruning; ``seen`` is what collapses those duplicates while
-    folding.
-    """
-
+    schema: GraphSchema
     graph: Neo4jGraph
-    seen: set[str] = field(default_factory=set)
 
-    def merge(self, graph: Neo4jGraph) -> _GraphAccumulator:
-        """Fold one chunk graph into the accumulator, deduplicating nodes by id."""
-        for node in graph.nodes:
-            if node.id not in self.seen:
-                self.seen.add(node.id)
-                self.graph.nodes.append(node)
-        self.graph.relationships.extend(graph.relationships)
-        return self
+
+def _empty_accumulator() -> dict[str, _DocAccumulator]:
+    """Fresh per-document accumulator map for the terminal reduce."""
+    return {}
 
 
 class SimpleKGPipelineResult(BaseModel):
     """Result of a :class:`SimpleKGPipeline` run.
 
     Attributes:
-        writer: The writer result for the single merged-graph write. Empty
+        writer: The writer results for the documents written this run. Empty
             unless the run used the default
             :class:`~neo4j_graphrag.pipeline.sinks.KGWriterSink`.
         resolver: Entity resolution statistics, if entity resolution was
             performed.
-        errors: Per-chunk failures captured while ``on_error="IGNORE"``.
-            Empty when ``on_error="RAISE"`` (the first failure aborts the
-            run instead).
+        errors: Per-chunk extraction failures (and whole-document
+            embed/prepare/prune failures) captured while
+            ``on_error="IGNORE"``. Empty when ``on_error="RAISE"``.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -252,12 +279,10 @@ class SimpleKGPipeline:
             labels and relationship types in the lexical graph.
         neo4j_database (Optional[str]): Neo4j database name.
         map_batch_size (int): Number of items processed concurrently by each
-            async stage. Default: 100.
-
-    All chunk graphs are merged into a single graph before writing, so the
-    sink receives exactly one element per run. Database write batching is
-    the writer's concern — pass ``kg_writer=Neo4jWriter(..., batch_size=...)``
-    to control it.
+            async stage. For the extraction stage this is the number of
+            concurrent LLM calls, so it doubles as the LLM concurrency knob
+            (replacing the extractor's ``max_concurrency``, which the
+            chunk-scoped path does not use). Default: 5.
     """
 
     def __init__(
@@ -268,8 +293,8 @@ class SimpleKGPipeline:
         schema: Optional[
             Union[GraphSchema, dict[str, Any], Literal["FREE", "EXTRACTED"]]
         ] = None,
-        text_splitter: TextSplitter = FixedSizeSplitter(),
-        file_loader: DataLoader = _DefaultDataLoader(),
+        text_splitter: Optional[TextSplitter] = None,
+        file_loader: Optional[DataLoader] = None,
         kg_writer: Optional[KGWriter] = None,
         sink: Optional[Sink[Neo4jGraph]] = None,
         on_error: str = "IGNORE",
@@ -277,10 +302,15 @@ class SimpleKGPipeline:
         perform_entity_resolution: bool = True,
         lexical_graph_config: Optional[LexicalGraphConfig] = None,
         neo4j_database: Optional[str] = None,
-        map_batch_size: int = 100,
+        map_batch_size: int = 5,
     ):
         if map_batch_size < 1:
             raise ValueError(f"map_batch_size must be >= 1, got {map_batch_size!r}")
+        if isinstance(schema, str) and schema not in _SCHEMA_LITERALS:
+            raise ValueError(
+                f"Unknown schema value {schema!r}; expected 'FREE', 'EXTRACTED', "
+                "a GraphSchema, a dict, or None."
+            )
         self.llm = llm
         self.driver = driver
         self.embedder = embedder
@@ -290,19 +320,16 @@ class SimpleKGPipeline:
         self.lexical_graph_config = lexical_graph_config or LexicalGraphConfig()
         self.map_batch_size = map_batch_size
 
-        self.text_splitter = text_splitter
-        self.file_loader = file_loader
+        self.text_splitter = text_splitter or FixedSizeSplitter()
+        self.file_loader = file_loader or _DefaultDataLoader()
         self.chunk_embedder = TextChunkEmbedder(embedder=embedder)
         self.lexical_graph_builder = LexicalGraphBuilder(
             config=self.lexical_graph_config
         )
-        # on_error=RAISE: per-chunk failures surface as exceptions and the
-        # pipeline decides how to handle them (captured as Err values when
-        # self.on_error is IGNORE).
         self.extractor = LLMEntityRelationExtractor(
             llm=llm,
             prompt_template=prompt_template,
-            on_error=OnError.RAISE,
+            on_error=self.on_error,
             use_structured_output=llm.supports_structured_output,
         )
         self.pruner = GraphPruning()
@@ -333,7 +360,8 @@ class SimpleKGPipeline:
         elif self.schema == "FREE":
             schema = GraphSchema.create_empty()
         else:
-            # "EXTRACTED" or None: infer the schema from the document text
+            # "EXTRACTED" or None: infer the schema from the document text.
+            # Any other string is rejected in __init__.
             schema = await SchemaFromTextExtractor(
                 llm=self.llm,
                 use_structured_output=self.llm.supports_structured_output,
@@ -344,97 +372,90 @@ class SimpleKGPipeline:
             schema=schema,
         )
 
-    async def _split(self, document: _Document) -> list[_Chunk]:
-        """Split into chunks, each linked to its predecessor by uid."""
-        chunks = (await self.text_splitter.run(text=document.text)).chunks
-        previous_uids: list[Optional[str]] = [None, *(c.uid for c in chunks[:-1])]
-        return [
-            _Chunk(
-                chunk=chunk,
-                document_info=document.document_info,
-                schema=document.schema,
-                previous_chunk_uid=previous_uid,
-            )
-            for chunk, previous_uid in zip(chunks, previous_uids)
-        ]
-
-    async def _embed(self, item: _Chunk) -> _Chunk:
-        embedded = await self.chunk_embedder.run(TextChunks(chunks=[item.chunk]))
-        return _Chunk(
-            chunk=embedded.chunks[0],
-            document_info=item.document_info,
-            schema=item.schema,
-            previous_chunk_uid=item.previous_chunk_uid,
+    async def _split(self, document: _Document) -> _ChunkedDocument:
+        chunks = await self.text_splitter.run(text=document.text)
+        return _ChunkedDocument(
+            document_info=document.document_info,
+            schema=document.schema,
+            chunks=chunks,
         )
 
-    async def _build_lexical_graph(self, item: _Chunk) -> _LexicalChunkGraph:
-        """Build this chunk's lexical graph.
+    async def _embed(self, document: _ChunkedDocument) -> _ChunkedDocument:
+        embedded = await self.chunk_embedder.run(document.chunks)
+        return _ChunkedDocument(
+            document_info=document.document_info,
+            schema=document.schema,
+            chunks=embedded,
+        )
 
-        Runs before extraction: it moves the chunk's embedding out of
-        ``metadata`` and onto the Chunk node, so extraction never sees it.
+    async def _prepare(
+        self, document: _ChunkedDocument
+    ) -> list[_LexicalPart | _ChunkPart]:
+        """Build the document's lexical graph and fan out into parts.
+
+        The lexical graph is built here, outside the failable extraction
+        path, and is emitted as the first part so it reaches the terminal
+        merge even if every chunk fails extraction.
         """
         lexical_graph = (
             await self.lexical_graph_builder.run(
-                text_chunks=TextChunks(chunks=[item.chunk]),
-                document_info=item.document_info,
+                text_chunks=document.chunks,
+                document_info=document.document_info,
             )
         ).graph
-        return _LexicalChunkGraph(
-            lexical_graph=lexical_graph,
-            chunk=item.chunk,
-            schema=item.schema,
-            previous_chunk_uid=item.previous_chunk_uid,
+        doc_id = document.document_info.uid
+        parts: list[_LexicalPart | _ChunkPart] = [
+            _LexicalPart(doc_id=doc_id, schema=document.schema, graph=lexical_graph)
+        ]
+        parts.extend(
+            _ChunkPart(doc_id=doc_id, schema=document.schema, chunk=chunk)
+            for chunk in document.chunks.chunks
         )
+        return parts
 
-    async def _extract(self, item: _LexicalChunkGraph) -> _ChunkGraph:
-        """Extract this chunk's entities and merge with its lexical graph.
+    async def _extract_part(self, part: _LexicalPart | _ChunkPart) -> _GraphPart:
+        """Turn a part into a graph.
 
-        Concurrency is bounded by the pipeline's ``map_batch_size``, so no
-        semaphore is needed (or safe: each batch runs on its own event loop).
+        The lexical part is already a graph and passes through untouched
+        (this is the one dispatch the single-stream DSL forces: the per-part
+        element is either a ready lexical graph or a chunk to extract).
         """
-        entity_graph = await self.extractor.extract_chunk(
-            item.chunk,
-            item.schema,
-            "",
-            self.lexical_graph_builder,
+        if isinstance(part, _LexicalPart):
+            return _GraphPart(doc_id=part.doc_id, schema=part.schema, graph=part.graph)
+        entity_graph = await self.extractor.extract_chunk(part.chunk, part.schema)
+        # FROM_CHUNK edges are a lexical concern, added after extraction so
+        # the extractor itself stays lexical-agnostic.
+        await self.lexical_graph_builder.process_chunk_extracted_entities(
+            entity_graph,
+            part.chunk,
         )
-        return _ChunkGraph(
-            graph=self.extractor.combine_chunk_graphs(
-                item.lexical_graph, [entity_graph]
-            ),
-            chunk_uid=item.chunk.uid,
-            schema=item.schema,
-            previous_chunk_uid=item.previous_chunk_uid,
-        )
+        return _GraphPart(doc_id=part.doc_id, schema=part.schema, graph=entity_graph)
 
-    async def _prune(self, item: _ChunkGraph) -> _ChunkGraph:
+    @staticmethod
+    def _combine(
+        acc: dict[str, _DocAccumulator], part: _GraphPart
+    ) -> dict[str, _DocAccumulator]:
+        """Fold a part into its document's graph.
+
+        The lexical part arrives first, so a document's accumulator is
+        seeded with its full lexical graph before any chunk graphs. Entity
+        ids are chunk-prefixed, so parts never overlap; no dedup needed.
+        """
+        doc = acc.get(part.doc_id)
+        if doc is None:
+            doc = _DocAccumulator(schema=part.schema, graph=Neo4jGraph())
+            acc[part.doc_id] = doc
+        doc.graph.nodes.extend(part.graph.nodes)
+        doc.graph.relationships.extend(part.graph.relationships)
+        return acc
+
+    async def _prune(self, doc: _DocAccumulator) -> Neo4jGraph:
         pruned = await self.pruner.run(
-            graph=item.graph,
-            schema=item.schema,
+            graph=doc.graph,
+            schema=doc.schema,
             lexical_graph_config=self.lexical_graph_config,
         )
-        return _ChunkGraph(
-            graph=pruned.graph,
-            chunk_uid=item.chunk_uid,
-            schema=item.schema,
-            previous_chunk_uid=item.previous_chunk_uid,
-        )
-
-    def _link_previous_chunk(self, item: _ChunkGraph) -> Neo4jGraph:
-        """Add the NEXT_CHUNK edge from the predecessor chunk.
-
-        Runs after pruning: the predecessor's Chunk node lives in a different
-        chunk graph, so the pruner would drop the edge as dangling.
-        """
-        if item.previous_chunk_uid is not None:
-            item.graph.relationships.append(
-                Neo4jRelationship(
-                    start_node_id=item.previous_chunk_uid,
-                    end_node_id=item.chunk_uid,
-                    type=self.lexical_graph_config.next_chunk_relationship_type,
-                )
-            )
-        return item.graph
+        return pruned.graph
 
     # ------------------------------------------------------------------
     # Run
@@ -454,53 +475,54 @@ class SimpleKGPipeline:
         """Run the knowledge-graph building pipeline.
 
         Args:
-            file_path (str): Path to a single PDF or Markdown file on any
-                fsspec-supported backend.
+            file_path (str): Path to a single PDF or Markdown file, a
+                directory (listed recursively), or a glob pattern, on any
+                fsspec-supported backend. ``text=`` input is not yet
+                supported; the experimental
+                :class:`~neo4j_graphrag.experimental.pipeline.kg_builder.SimpleKGPipeline`
+                accepts it.
             document_metadata (Optional[dict[str, str]]): Metadata attached
                 to the Document node.
 
         Returns:
-            SimpleKGPipelineResult: Writer/resolver results and any per-chunk
-            errors (``on_error="IGNORE"``).
+            SimpleKGPipelineResult: Writer/resolver results and any
+            per-chunk errors (``on_error="IGNORE"``).
 
         Raises:
             Exception: A load, schema or split failure, or the first failing
                 chunk when ``on_error="RAISE"``.
         """
         source = FsspecSource(file_path, extensions=SUPPORTED_EXTENSIONS)
-        self.errors = []  # per-run: do not leak errors into the next run
+        # Per-run state: do not leak errors or writer results into the next run.
+        self.errors = []
+        if isinstance(self.sink, KGWriterSink):
+            self.sink.results = []
 
         async def _load(file: FsspecFile) -> LoadedDocument:
             return await self.file_loader.run(
                 filepath=file.path, metadata=document_metadata, fs=file.fs
             )
 
-        def _raise(err: Err) -> None:
-            raise err.exception
-
         def _run() -> None:
             (
                 Pipeline.from_source(source)
+                # load / schema / split failures are fatal
                 .map_async_chunked(_load, self.map_batch_size)
                 .map_async_chunked(self._resolve_schema, self.map_batch_size)
-                .map_async_chunked_safe(self._split, self.map_batch_size)
-                .flatten_ok()
-                .on_error(_raise)  # split failures are fatal, not per-chunk
+                .map_async_chunked(self._split, self.map_batch_size)
+                # embed / prepare (lexical build) → per-document, failable
                 .map_async_chunked_safe(self._embed, self.map_batch_size)
-                .map_async_chunked_safe(self._build_lexical_graph, self.map_batch_size)
-                .map_async_chunked_safe(self._extract, self.map_batch_size)
-                .map_async_chunked_safe(self._prune, self.map_batch_size)
-                .map_ok(self._link_previous_chunk)
+                .map_async_chunked_safe(self._prepare, self.map_batch_size)
+                .flatten_ok()
+                # extract → per-chunk, failable
+                .map_async_chunked_safe(self._extract_part, self.map_batch_size)
                 .on_error(self.error_handler)
-                # The zero accumulator is created here, inside _run, so each
-                # run starts from an empty graph.
-                .reduce(
-                    zero=_GraphAccumulator(graph=Neo4jGraph()),
-                    combine=_GraphAccumulator.merge,
-                )
-                .map(lambda acc: acc.graph)
-                # an empty stream (e.g. a document with no chunks) writes nothing
-                .filter(lambda graph: bool(graph.nodes or graph.relationships))
+                # merge chunks back under their document
+                .reduce(zero=_empty_accumulator(), combine=self._combine)
+                .flat_map(lambda acc: acc.values())
+                # prune → per-document, failable
+                .map_async_chunked_safe(self._prune, self.map_batch_size)
+                .on_error(self.error_handler)
                 .to_sink(self.sink)
             )
 

@@ -18,9 +18,11 @@
 This example uses :class:`neo4j_graphrag.pipeline.kg_builder.SimpleKGPipeline`,
 the successor of the experimental pipeline shown in ``examples/kg_builder.py``.
 Instead of wiring components into a DAG by hand, documents flow from a
-``Source`` through a single operator chain (load → split → embed → extract →
-prune → link → write) into a ``Sink``, with bounded memory and per-chunk
-error handling.
+``Source`` through a single operator chain (load → resolve schema → split →
+embed → extract → prune → write) into a ``Sink``, one graph per document,
+with per-chunk error handling. The lexical graph (Document and Chunk nodes,
+the ``NEXT_CHUNK`` chain) is built by the extractor so it survives chunks
+that fail extraction.
 
 This example assumes a Neo4j db is up and running. Update the credentials
 below if needed.
@@ -128,8 +130,9 @@ async def define_and_run_pipeline(
     neo4j_driver: neo4j.Driver, llm: LLMInterface
 ) -> SimpleKGPipelineResult:
     # The new SimpleKGPipeline builds the whole operator chain for you:
-    # load -> resolve schema -> split -> embed -> extract -> prune ->
-    # link chunks -> merge write batches -> write to Neo4j.
+    # load -> resolve schema -> split -> embed -> extract -> prune -> write.
+    # Each document is written as it completes; the lexical graph
+    # (Document/Chunk nodes, NEXT_CHUNK) survives chunks that fail extraction.
     kg_builder = SimpleKGPipeline(
         llm=llm,
         driver=neo4j_driver,
@@ -139,9 +142,9 @@ async def define_and_run_pipeline(
             "relationship_types": RELATIONSHIP_TYPES,
             "patterns": PATTERNS,
         },
-        # on_error="IGNORE" (default): failing chunks are skipped and
+        # on_error="IGNORE" (default): failing documents are skipped and
         # collected in SimpleKGPipelineResult.errors. Use "RAISE" to abort
-        # the run on the first failing chunk.
+        # the run on the first failing document.
         on_error="IGNORE",
         neo4j_database=DATABASE,
     )
@@ -164,7 +167,7 @@ async def main() -> SimpleKGPipelineResult:
             "response_format": {"type": "json_object"},
         },
         # The dataflow pipeline's blocking interpreter runs each batch of
-        # chunks on its own event loop (asyncio.run per batch). With the
+        # documents on its own event loop (asyncio.run per batch). With the
         # default httpx pooling, keep-alive connections would stay bound to
         # those short-lived loops and crash aclose() with "Event loop is
         # closed". Disabling keep-alive closes each connection on the loop
@@ -179,6 +182,6 @@ async def main() -> SimpleKGPipelineResult:
 if __name__ == "__main__":
     res = asyncio.run(main())
     print(res)
-    # Per-chunk failures captured with on_error="IGNORE":
+    # Per-document failures captured with on_error="IGNORE":
     for err in res.errors:
-        logging.warning("chunk failed: %s", err.exception)
+        logging.warning("document failed: %s", err.exception)

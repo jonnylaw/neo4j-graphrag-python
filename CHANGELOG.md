@@ -2,6 +2,15 @@
 
 ## Next
 
+### Added
+
+- Added `neo4j_graphrag.pipeline.sources` (`FsspecSource`, `FsspecFile`) and `neo4j_graphrag.pipeline.sinks` (`KGWriterSink`, `InMemoryGraphSink`), building on the pipeline DSL added in 1.19.0.
+- Added `neo4j_graphrag.pipeline.kg_builder.SimpleKGPipeline`, a knowledge-graph builder that builds the lexical graph once per document (non-failable) and runs entity extraction per chunk (failable), then re-groups chunks under their document before writing. A chunk that fails extraction no longer orphans its Chunk node or severs the `NEXT_CHUNK` chain.
+
+### Changed
+
+- (`neo4j_graphrag.components`) `DataLoader.run` now declares a keyword `fs` argument on the abstract method, matching the built-in `PdfLoader`/`MarkdownLoader` signatures. Custom loaders that implement the old two-argument signature will raise a `TypeError` when passed `fs=`.
+
 ## 1.19.0
 
 ### Added
