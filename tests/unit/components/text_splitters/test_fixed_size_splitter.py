@@ -17,6 +17,7 @@ from itertools import zip_longest
 
 import pytest
 from neo4j_graphrag.components.text_splitters.fixed_size_splitter import (
+    PREV_CHUNK_UID,
     FixedSizeSplitter,
     _adjust_chunk_end,
     _adjust_chunk_start,
@@ -75,6 +76,30 @@ async def test_split_text_empty_string() -> None:
     splitter = FixedSizeSplitter(chunk_size, chunk_overlap, approximate)
     chunks = await splitter.run(text)
     assert chunks.chunks == []
+
+
+@pytest.mark.asyncio
+async def test_no_prev_chunk_uid_by_default() -> None:
+    splitter = FixedSizeSplitter(chunk_size=5, chunk_overlap=0, approximate=False)
+    chunks = await splitter.run("may thy knife chip and shatter")
+    assert len(chunks.chunks) > 1
+    for chunk in chunks.chunks:
+        assert chunk.metadata is None or PREV_CHUNK_UID not in chunk.metadata
+
+
+@pytest.mark.asyncio
+async def test_create_prev_chunk_uid_stamps_predecessor() -> None:
+    splitter = FixedSizeSplitter(
+        chunk_size=5, chunk_overlap=0, approximate=False, create_prev_chunk_uid=True
+    )
+    chunks = await splitter.run("may thy knife chip and shatter")
+    assert len(chunks.chunks) > 1
+    # the first chunk has no predecessor; every later chunk points at the
+    # uid of the chunk before it
+    first, *rest = chunks.chunks
+    assert first.metadata is None or PREV_CHUNK_UID not in first.metadata
+    for prev, chunk in zip(chunks.chunks, rest):
+        assert chunk.metadata == {PREV_CHUNK_UID: prev.uid}
 
 
 def test_invalid_chunk_overlap() -> None:

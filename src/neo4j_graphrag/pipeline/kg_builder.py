@@ -23,41 +23,35 @@ chain into a :class:`~neo4j_graphrag.pipeline.sink.Sink`::
     Source[FsspecFile]
       → load            file            → LoadedDocument
       → resolve_schema  document        → document + GraphSchema
-      → split           document        → chunks
-      → embed           document        → chunks + embeddings
-      → prepare         document        → [lexical graph, chunk, chunk, …]
-      → extract         chunk           → entity graph (with FROM_CHUNK edges)
-      → reduce          per document    → merged lexical + entity graph
+      → split           document        → chunk, chunk, …
+      → embed           chunk           → chunk + embedding
+      → extract         chunk           → chunk graph (lexical + entities)
+      → reduce          per document    → merged graph
       → prune           document graph  → schema-conformant graph
       → Sink[Neo4jGraph]
 
-**Decision — lexical per-document, extraction per-chunk.** The two are
-decoupled, not fused:
+**Decision — extraction per chunk, lexical graph included.** Each chunk
+flows independently through
+:meth:`~neo4j_graphrag.components.entity_relation_extractor.LLMEntityRelationExtractor.run`
+with a single-chunk input and default ``create_lexical_graph=True``, so its
+per-chunk graph holds the Document node, its own Chunk node, and the
+``FROM_DOCUMENT`` / ``FROM_CHUNK`` edges. The only structure that spans
+chunks is the ``NEXT_CHUNK`` chain: the splitter stamps each chunk with
+``metadata["prev_chunk_uid"]`` and the extraction stage turns it into a
+``NEXT_CHUNK`` edge *after* the extractor returns, outside the failable
+LLM path — no LLM call can create it, so no LLM failure can drop it.
 
-* The lexical graph (Document and Chunk nodes, ``FROM_DOCUMENT``, and the
-  unbroken ``NEXT_CHUNK`` chain) is built once per document in a
-  *non-failable* stage by
-  :meth:`~neo4j_graphrag.components.lexical_graph.LexicalGraphBuilder.run`.
-  It makes no LLM calls, so a failure there is a bug and is fatal.
-
-* Entity extraction runs *per chunk* through
-  :meth:`~neo4j_graphrag.components.entity_relation_extractor.LLMEntityRelationExtractor.extract_chunk`
-  — a lexical-agnostic method that extracts entities and scopes their ids,
-  and does no lexical-graph work. A chunk that fails extraction yields an
-  ``Err`` for that chunk only; its Chunk node and every ``NEXT_CHUNK`` edge
-  were already committed to the lexical graph, so neither is orphaned or
-  severed by the failure. This is the granularity a transient LLM failure
+* A chunk that fails extraction yields an ``Err`` for that chunk only; the
+  Document and Chunk nodes and the ``NEXT_CHUNK`` chain of every surviving
+  chunk are unaffected. This is the granularity a transient LLM failure
   (rate limit, network) needs: one chunk fails, the rest of the document
   survives.
 
-The terminal ``reduce`` re-groups the extracted chunks back under their
-document and merges each into that document's lexical graph, so the sink
-sees one graph per document. (The DSL is single-stream and has no
-``join`` primitive, so the "one lexical graph + N chunk extractions" shape
-is expressed as a small tagged union of
-:class:`_LexicalPart` / :class:`_ChunkPart` elements; see ``_extract_part``.)
+* The Document node appears once per chunk and is deduplicated by id in
+  the terminal ``reduce`` (kg-builder's approach, where the resolver does
+  the same at write time), so the sink still sees one graph per document.
 
-Per-chunk extraction failures (and per-document embed/prepare/prune
+Per-chunk extraction failures (and per-chunk embed or per-document prune
 failures) are captured as :class:`~neo4j_graphrag.pipeline.result.Err`
 values when ``on_error="IGNORE"``; load, schema and split failures are
 always fatal.
@@ -100,7 +94,6 @@ from neo4j_graphrag.components.entity_relation_extractor import (
 )
 from neo4j_graphrag.components.graph_pruning import GraphPruning
 from neo4j_graphrag.components.kg_writer import KGWriter, KGWriterModel, Neo4jWriter
-from neo4j_graphrag.components.lexical_graph import LexicalGraphBuilder
 from neo4j_graphrag.components.resolver import SinglePropertyExactMatchResolver
 from neo4j_graphrag.components.schema import (
     GraphSchema,
@@ -109,6 +102,7 @@ from neo4j_graphrag.components.schema import (
 )
 from neo4j_graphrag.components.text_splitters.base import TextSplitter
 from neo4j_graphrag.components.text_splitters.fixed_size_splitter import (
+    PREV_CHUNK_UID,
     FixedSizeSplitter,
 )
 from neo4j_graphrag.components.types import (
@@ -116,6 +110,7 @@ from neo4j_graphrag.components.types import (
     LexicalGraphConfig,
     LoadedDocument,
     Neo4jGraph,
+    Neo4jRelationship,
     ResolutionStats,
     TextChunk,
     TextChunks,
@@ -179,36 +174,41 @@ class _ChunkedDocument:
 
 
 @dataclass(frozen=True)
-class _LexicalPart:
-    """The lexical graph of one document, built up front (non-failable).
+class _ChunkGraphPart:
+    """One chunk of a document after (failable) extraction: the chunk's
+    graph, carrying its document id so the terminal reduce can group chunks
+    back under their document."""
 
-    Emitted as a single part per document ahead of its chunks, so it reaches
-    the merge regardless of how many of the document's chunks fail.
+    doc_id: str
+    schema: GraphSchema
+    graph: Neo4jGraph
+
+
+def add_next_chunk_relationships(
+    graph: Neo4jGraph,
+    lexical_graph_config: LexicalGraphConfig,
+    chunk: TextChunk,
+) -> Neo4jGraph:
+    """Append the ``NEXT_CHUNK`` edge from the chunk's predecessor, if any.
+
+    The splitter stamps each chunk after the first with
+    ``metadata[PREV_CHUNK_UID]``; this pops that stamp and turns it into a
+    relationship. It runs outside the extractor because the edge's endpoints
+    span chunks — and outside the failable path, so an extraction failure
+    cannot sever the chain.
     """
-
-    doc_id: str
-    schema: GraphSchema
-    graph: Neo4jGraph
-
-
-@dataclass(frozen=True)
-class _ChunkPart:
-    """One chunk of a document, destined for (failable) entity extraction."""
-
-    doc_id: str
-    schema: GraphSchema
-    chunk: TextChunk
-
-
-@dataclass(frozen=True)
-class _GraphPart:
-    """A part that has yielded a graph: the lexical graph, or one chunk's
-    entity graph. Carries its document id so the terminal reduce can group
-    chunks back under their document."""
-
-    doc_id: str
-    schema: GraphSchema
-    graph: Neo4jGraph
+    metadata = chunk.metadata or {}
+    prev_chunk_uid = metadata.pop(PREV_CHUNK_UID, None)
+    if prev_chunk_uid is None:
+        return graph
+    graph.relationships.append(
+        Neo4jRelationship(
+            start_node_id=prev_chunk_uid,
+            end_node_id=chunk.chunk_id,
+            type=lexical_graph_config.next_chunk_relationship_type,
+        )
+    )
+    return graph
 
 
 @dataclass
@@ -233,8 +233,8 @@ class SimpleKGPipelineResult(BaseModel):
             :class:`~neo4j_graphrag.pipeline.sinks.KGWriterSink`.
         resolver: Entity resolution statistics, if entity resolution was
             performed.
-        errors: Per-chunk extraction failures (and whole-document
-            embed/prepare/prune failures) captured while
+        errors: Per-chunk extraction failures (and per-chunk embed or
+            per-document prune failures) captured while
             ``on_error="IGNORE"``. Empty when ``on_error="RAISE"``.
     """
 
@@ -258,7 +258,10 @@ class SimpleKGPipeline:
             dict with ``node_types`` / ``relationship_types`` / ``patterns``
             keys, ``"FREE"`` (no schema guidance), or ``"EXTRACTED"`` /
             ``None`` (schema is inferred per document by the LLM).
-        text_splitter (Optional[TextSplitter]): Defaults to ``FixedSizeSplitter()``.
+        text_splitter (Optional[TextSplitter]): Defaults to
+            ``FixedSizeSplitter(create_prev_chunk_uid=True)`` — the
+            ``prev_chunk_uid`` stamp is what the ``NEXT_CHUNK`` chain is
+            rebuilt from per chunk.
         file_loader (Optional[DataLoader]): Defaults to an extension-based
             loader supporting ``.pdf``, ``.md`` and ``.markdown``.
         kg_writer (Optional[KGWriter]): Defaults to ``Neo4jWriter``. Ignored
@@ -320,12 +323,11 @@ class SimpleKGPipeline:
         self.lexical_graph_config = lexical_graph_config or LexicalGraphConfig()
         self.map_batch_size = map_batch_size
 
-        self.text_splitter = text_splitter or FixedSizeSplitter()
+        self.text_splitter = text_splitter or FixedSizeSplitter(
+            create_prev_chunk_uid=True
+        )
         self.file_loader = file_loader or _DefaultDataLoader()
         self.chunk_embedder = TextChunkEmbedder(embedder=embedder)
-        self.lexical_graph_builder = LexicalGraphBuilder(
-            config=self.lexical_graph_config
-        )
         self.extractor = LLMEntityRelationExtractor(
             llm=llm,
             prompt_template=prompt_template,
@@ -372,13 +374,21 @@ class SimpleKGPipeline:
             schema=schema,
         )
 
-    async def _split(self, document: _Document) -> _ChunkedDocument:
+    async def _split(self, document: _Document) -> list[_ChunkedDocument]:
+        """Split the document and fan out to one item per chunk.
+
+        Each item carries a single-chunk ``TextChunks`` so downstream stages
+        (embed, extract) work per chunk.
+        """
         chunks = await self.text_splitter.run(text=document.text)
-        return _ChunkedDocument(
-            document_info=document.document_info,
-            schema=document.schema,
-            chunks=chunks,
-        )
+        return [
+            _ChunkedDocument(
+                document_info=document.document_info,
+                schema=document.schema,
+                chunks=TextChunks(chunks=[chunk]),
+            )
+            for chunk in chunks.chunks
+        ]
 
     async def _embed(self, document: _ChunkedDocument) -> _ChunkedDocument:
         embedded = await self.chunk_embedder.run(document.chunks)
@@ -388,64 +398,48 @@ class SimpleKGPipeline:
             chunks=embedded,
         )
 
-    async def _prepare(
-        self, document: _ChunkedDocument
-    ) -> list[_LexicalPart | _ChunkPart]:
-        """Build the document's lexical graph and fan out into parts.
+    async def _extract(self, document: _ChunkedDocument) -> _ChunkGraphPart:
+        """Extract one chunk into its graph.
 
-        The lexical graph is built here, outside the failable extraction
-        path, and is emitted as the first part so it reaches the terminal
-        merge even if every chunk fails extraction.
+        ``extractor.run`` with a single-chunk input and the default
+        ``create_lexical_graph=True`` builds the Document node, this chunk's
+        Chunk node, and the FROM_DOCUMENT / FROM_CHUNK edges alongside the
+        extracted entities — so the whole lexical graph survives any single
+        chunk's failure, at the cost of one repeated Document node per
+        chunk, deduplicated in the terminal reduce. The NEXT_CHUNK edge is
+        added afterwards: its endpoints span chunks, and no LLM call
+        touches it.
         """
-        lexical_graph = (
-            await self.lexical_graph_builder.run(
-                text_chunks=document.chunks,
-                document_info=document.document_info,
-            )
-        ).graph
-        doc_id = document.document_info.uid
-        parts: list[_LexicalPart | _ChunkPart] = [
-            _LexicalPart(doc_id=doc_id, schema=document.schema, graph=lexical_graph)
-        ]
-        parts.extend(
-            _ChunkPart(doc_id=doc_id, schema=document.schema, chunk=chunk)
-            for chunk in document.chunks.chunks
+        chunk = document.chunks.chunks[0]
+        graph = await self.extractor.run(
+            chunks=document.chunks,
+            document_info=document.document_info,
+            lexical_graph_config=self.lexical_graph_config,
+            schema=document.schema,
         )
-        return parts
-
-    async def _extract_part(self, part: _LexicalPart | _ChunkPart) -> _GraphPart:
-        """Turn a part into a graph.
-
-        The lexical part is already a graph and passes through untouched
-        (this is the one dispatch the single-stream DSL forces: the per-part
-        element is either a ready lexical graph or a chunk to extract).
-        """
-        if isinstance(part, _LexicalPart):
-            return _GraphPart(doc_id=part.doc_id, schema=part.schema, graph=part.graph)
-        entity_graph = await self.extractor.extract_chunk(part.chunk, part.schema)
-        # FROM_CHUNK edges are a lexical concern, added after extraction so
-        # the extractor itself stays lexical-agnostic.
-        await self.lexical_graph_builder.process_chunk_extracted_entities(
-            entity_graph,
-            part.chunk,
+        add_next_chunk_relationships(graph, self.lexical_graph_config, chunk)
+        return _ChunkGraphPart(
+            doc_id=document.document_info.uid, schema=document.schema, graph=graph
         )
-        return _GraphPart(doc_id=part.doc_id, schema=part.schema, graph=entity_graph)
 
-    @staticmethod
     def _combine(
-        acc: dict[str, _DocAccumulator], part: _GraphPart
+        self,
+        acc: dict[str, _DocAccumulator],
+        part: _ChunkGraphPart,
     ) -> dict[str, _DocAccumulator]:
-        """Fold a part into its document's graph.
+        """Fold a chunk graph into its document's graph.
 
-        The lexical part arrives first, so a document's accumulator is
-        seeded with its full lexical graph before any chunk graphs. Entity
-        ids are chunk-prefixed, so parts never overlap; no dedup needed.
+        Entity ids are chunk-prefixed, so entity parts never overlap. The
+        lexical nodes (Document, Chunk) are repeated per chunk and
+        deduplicated by id here — the same dedup kg-builder relies on its
+        resolver for.
         """
         doc = acc.get(part.doc_id)
         if doc is None:
             doc = _DocAccumulator(schema=part.schema, graph=Neo4jGraph())
             acc[part.doc_id] = doc
-        doc.graph.nodes.extend(part.graph.nodes)
+        seen = {node.id for node in doc.graph.nodes}
+        doc.graph.nodes.extend(node for node in part.graph.nodes if node.id not in seen)
         doc.graph.relationships.extend(part.graph.relationships)
         return acc
 
@@ -510,12 +504,10 @@ class SimpleKGPipeline:
                 .map_async_chunked(_load, self.map_batch_size)
                 .map_async_chunked(self._resolve_schema, self.map_batch_size)
                 .map_async_chunked(self._split, self.map_batch_size)
-                # embed / prepare (lexical build) → per-document, failable
+                .flat_map(lambda parts: parts)
+                # embed / extract → per-chunk, failable
                 .map_async_chunked_safe(self._embed, self.map_batch_size)
-                .map_async_chunked_safe(self._prepare, self.map_batch_size)
-                .flatten_ok()
-                # extract → per-chunk, failable
-                .map_async_chunked_safe(self._extract_part, self.map_batch_size)
+                .map_async_chunked_safe(self._extract, self.map_batch_size)
                 .on_error(self.error_handler)
                 # merge chunks back under their document
                 .reduce(zero=_empty_accumulator(), combine=self._combine)

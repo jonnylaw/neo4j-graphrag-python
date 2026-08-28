@@ -5,7 +5,8 @@
 ### Added
 
 - Added `neo4j_graphrag.pipeline.sources` (`FsspecSource`, `FsspecFile`) and `neo4j_graphrag.pipeline.sinks` (`KGWriterSink`, `InMemoryGraphSink`), building on the pipeline DSL added in 1.19.0.
-- Added `neo4j_graphrag.pipeline.kg_builder.SimpleKGPipeline`, a knowledge-graph builder that builds the lexical graph once per document (non-failable) and runs entity extraction per chunk (failable), then re-groups chunks under their document before writing. A chunk that fails extraction no longer orphans its Chunk node or severs the `NEXT_CHUNK` chain.
+- Added `neo4j_graphrag.pipeline.kg_builder.SimpleKGPipeline`, a knowledge-graph builder that fans each document out to one element per chunk and runs entity extraction per chunk through `LLMEntityRelationExtractor.run` with the default lexical graph (failable), then re-groups chunks under their document before writing. The default splitter stamps each chunk with `prev_chunk_uid`, and the `NEXT_CHUNK` edge is added outside the failable extraction path, so a chunk that fails extraction affects that chunk only.
+- Added `create_prev_chunk_uid` to `FixedSizeSplitter`: each chunk after the first carries `metadata["prev_chunk_uid"]` with the uid of the preceding chunk (new `PREV_CHUNK_UID` constant in `neo4j_graphrag.components.text_splitters.fixed_size_splitter`).
 
 ### Changed
 

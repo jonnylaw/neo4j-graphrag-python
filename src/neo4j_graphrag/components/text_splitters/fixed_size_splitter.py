@@ -12,10 +12,16 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+from typing import Optional
+
 from pydantic import validate_call
 
 from neo4j_graphrag.components.text_splitters.base import TextSplitter
 from neo4j_graphrag.components.types import TextChunk, TextChunks
+
+#: Metadata key a splitter can use to link each chunk to its predecessor,
+#: so a consumer can rebuild the NEXT_CHUNK chain without re-splitting.
+PREV_CHUNK_UID = "prev_chunk_uid"
 
 
 def _adjust_chunk_start(text: str, approximate_start: int) -> int:
@@ -77,6 +83,10 @@ class FixedSizeSplitter(TextSplitter):
                             with each chunk. Must be less than `chunk_size`.
         approximate (bool): If True, avoids splitting words in the middle at chunk
                             boundaries. Defaults to True.
+        create_prev_chunk_uid (bool): If True, each chunk after the first carries
+                            ``metadata[PREV_CHUNK_UID]`` with the uid of the
+                            preceding chunk, so the chunk order survives
+                            fan-out. Defaults to False.
 
 
     Example:
@@ -93,7 +103,11 @@ class FixedSizeSplitter(TextSplitter):
 
     @validate_call
     def __init__(
-        self, chunk_size: int = 4000, chunk_overlap: int = 200, approximate: bool = True
+        self,
+        chunk_size: int = 4000,
+        chunk_overlap: int = 200,
+        approximate: bool = True,
+        create_prev_chunk_uid: bool = False,
     ) -> None:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be strictly greater than 0")
@@ -102,6 +116,7 @@ class FixedSizeSplitter(TextSplitter):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.approximate = approximate
+        self.create_prev_chunk_uid = create_prev_chunk_uid
 
     @validate_call
     async def run(self, text: str) -> TextChunks:
@@ -120,6 +135,7 @@ class FixedSizeSplitter(TextSplitter):
         approximate_start = 0
         skip_adjust_chunk_start = False
         end = 0
+        prev_uid: Optional[str] = None
 
         while end < text_length:
             if self.approximate:
@@ -141,8 +157,13 @@ class FixedSizeSplitter(TextSplitter):
                 end = min(start + self.chunk_size, text_length)
 
             chunk_text = text[start:end]
-            chunks.append(TextChunk(text=chunk_text, index=index))
+            metadata: Optional[dict[str, str]] = None
+            if self.create_prev_chunk_uid and prev_uid is not None:
+                metadata = {PREV_CHUNK_UID: prev_uid}
+            chunk = TextChunk(text=chunk_text, index=index, metadata=metadata)
+            chunks.append(chunk)
             index += 1
+            prev_uid = chunk.uid
 
             # Normal advancement is `start + step`, which lets the next iteration
             # pick up where this chunk ended (minus overlap). However, if

@@ -330,24 +330,23 @@ class LLMEntityRelationExtractor(EntityRelationExtractor):
         chunk: TextChunk,
         schema: GraphSchema,
         examples: str = "",
+        lexical_graph_builder: Optional[LexicalGraphBuilder] = None,
     ) -> Neo4jGraph:
-        """Extract the entity graph for a single chunk, with ids made chunk-unique.
+        """Run extraction, validation and post processing for a single chunk,
+        without any concurrency control.
 
-        This is the decoupled, lexical-graph-agnostic half of extraction: it
-        runs extraction and scopes entity ids to the chunk, but does no
-        lexical-graph work (no ``FROM_CHUNK`` edges, no Chunk/Document
-        nodes). The caller is responsible for those, which lets a streaming
-        caller (e.g.
-        :class:`~neo4j_graphrag.pipeline.kg_builder.SimpleKGPipeline`) build
-        the lexical graph once per document, outside the failable per-chunk
-        path, so a chunk that fails extraction cannot sever it.
-
-        No concurrency control: callers manage it themselves. Batch callers
-        should use :meth:`run`, which bounds concurrency with a semaphore and
-        also builds the lexical graph.
+        Intended for streaming callers that bound concurrency themselves
+        (e.g. :class:`~neo4j_graphrag.pipeline.kg_builder.SimpleKGPipeline`).
+        Batch callers should use :meth:`run`, which bounds concurrency with
+        a semaphore.
         """
         chunk_graph = await self.extract_for_chunk(schema, examples, chunk)
-        self.update_ids(chunk_graph, chunk)
+        # final_chunk_graph = self.validate_chunk(chunk_graph, schema)
+        await self.post_process_chunk(
+            chunk_graph,
+            chunk,
+            lexical_graph_builder,
+        )
         return chunk_graph
 
     async def run_for_chunk(
@@ -360,14 +359,12 @@ class LLMEntityRelationExtractor(EntityRelationExtractor):
     ) -> Neo4jGraph:
         """Run extraction, validation and post processing for a single chunk"""
         async with sem:
-            chunk_graph = await self.extract_for_chunk(schema, examples, chunk)
-            # final_chunk_graph = self.validate_chunk(chunk_graph, schema)
-            await self.post_process_chunk(
-                chunk_graph,
+            return await self.extract_chunk(
                 chunk,
+                schema,
+                examples,
                 lexical_graph_builder,
             )
-            return chunk_graph
 
     @validate_call
     async def run(

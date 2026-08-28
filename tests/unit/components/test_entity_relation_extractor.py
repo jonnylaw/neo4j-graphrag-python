@@ -25,7 +25,6 @@ from neo4j_graphrag.components.entity_relation_extractor import (
     balance_curly_braces,
     fix_invalid_json,
 )
-from neo4j_graphrag.components.schema import GraphSchema
 from neo4j_graphrag.components.types import (
     DocumentInfo,
     Neo4jGraph,
@@ -228,26 +227,6 @@ async def test_extractor_custom_prompt() -> None:
     chunks = TextChunks(chunks=[TextChunk(text="some text", index=0)])
     await extractor.run(chunks=chunks)
     llm.ainvoke.assert_called_once_with("this is my prompt")
-
-
-@pytest.mark.asyncio
-async def test_extract_chunk_is_lexical_agnostic() -> None:
-    llm = MagicMock(spec=LLMInterface)
-    llm.ainvoke.return_value = LLMResponse(
-        content='{"nodes": [{"id": "0", "label": "Person", "properties": {}}], "relationships": []}'
-    )
-
-    extractor = LLMEntityRelationExtractor(llm=llm)
-    chunk = TextChunk(text="some text", index=0)
-    graph = await extractor.extract_chunk(chunk, GraphSchema.create_empty())
-
-    # ids were scoped to the chunk, and no lexical-graph relationships
-    # (FROM_CHUNK / FROM_DOCUMENT / NEXT_CHUNK) were added — the caller owns
-    # those, so a failing chunk cannot sever the lexical graph.
-    assert len(graph.nodes) == 1
-    assert graph.nodes[0].id == f"{chunk.chunk_id}:0"
-    assert graph.nodes[0].label == "Person"
-    assert graph.relationships == []
 
 
 def test_fix_invalid_json_empty_result() -> None:
