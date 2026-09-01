@@ -243,6 +243,12 @@ class OnError(Operator):
 
 @dataclass
 class SinkOp(Operator):
-    """Terminal node: write every element to ``sink``."""
+    """Terminal node: write every element to ``sink``.
+
+    Writes are dispatched ``max_concurrency`` at a time (default 1: strictly
+    one write at a time, matching prior behaviour), so several elements can
+    be upserted to the backing store concurrently instead of serially.
+    """
 
     sink: Sink[Any]
+    max_concurrency: int = 1

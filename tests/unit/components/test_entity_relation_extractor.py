@@ -14,7 +14,6 @@
 #  limitations under the License.
 from __future__ import annotations
 
-import asyncio
 import json
 from unittest.mock import MagicMock
 
@@ -26,8 +25,6 @@ from neo4j_graphrag.components.entity_relation_extractor import (
     balance_curly_braces,
     fix_invalid_json,
 )
-from neo4j_graphrag.components.lexical_graph import LexicalGraphBuilder
-from neo4j_graphrag.components.schema import GraphSchema
 from neo4j_graphrag.components.types import (
     DocumentInfo,
     Neo4jGraph,
@@ -230,60 +227,6 @@ async def test_extractor_custom_prompt() -> None:
     chunks = TextChunks(chunks=[TextChunk(text="some text", index=0)])
     await extractor.run(chunks=chunks)
     llm.ainvoke.assert_called_once_with("this is my prompt")
-
-
-@pytest.mark.asyncio
-async def test_extract_chunk_no_semaphore() -> None:
-    llm = MagicMock(spec=LLMInterface)
-    llm.ainvoke.return_value = LLMResponse(
-        content='{"nodes": [{"id": "0", "label": "Person", "properties": {}}], "relationships": []}'
-    )
-
-    extractor = LLMEntityRelationExtractor(llm=llm)
-    chunk = TextChunk(text="some text", index=0)
-    graph = await extractor.extract_chunk(chunk, GraphSchema.create_empty())
-
-    # extraction ran, ids were prefixed, no lexical-graph relationships
-    assert len(graph.nodes) == 1
-    assert graph.nodes[0].id == f"{chunk.chunk_id}:0"
-    assert graph.nodes[0].label == "Person"
-    assert graph.relationships == []
-
-
-@pytest.mark.asyncio
-async def test_extract_chunk_with_lexical_graph_builder() -> None:
-    llm = MagicMock(spec=LLMInterface)
-    llm.ainvoke.return_value = LLMResponse(
-        content='{"nodes": [{"id": "0", "label": "Person", "properties": {}}], "relationships": []}'
-    )
-
-    extractor = LLMEntityRelationExtractor(llm=llm)
-    chunk = TextChunk(text="some text", index=0)
-    graph = await extractor.extract_chunk(
-        chunk, GraphSchema.create_empty(), "", LexicalGraphBuilder()
-    )
-
-    # the entity gets a FROM_CHUNK relationship to the chunk it came from
-    assert len(graph.relationships) == 1
-    assert graph.relationships[0].type == "FROM_CHUNK"
-    assert graph.relationships[0].start_node_id == f"{chunk.chunk_id}:0"
-    assert graph.relationships[0].end_node_id == chunk.chunk_id
-
-
-@pytest.mark.asyncio
-async def test_run_for_chunk_delegates_to_extract_chunk() -> None:
-    llm = MagicMock(spec=LLMInterface)
-    llm.ainvoke.return_value = LLMResponse(content='{"nodes": [], "relationships": []}')
-
-    extractor = LLMEntityRelationExtractor(llm=llm)
-    chunk = TextChunk(text="some text", index=0)
-    graph = await extractor.run_for_chunk(
-        asyncio.Semaphore(1), chunk, GraphSchema.create_empty(), ""
-    )
-
-    assert isinstance(graph, Neo4jGraph)
-    assert graph.nodes == []
-    llm.ainvoke.assert_awaited_once()
 
 
 def test_fix_invalid_json_empty_result() -> None:

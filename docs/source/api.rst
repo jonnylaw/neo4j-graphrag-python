@@ -157,6 +157,49 @@ SimpleKGPipeline
     :members: run_async
 
 
+*********************
+Dataflow pipeline DSL
+*********************
+
+The :mod:`neo4j_graphrag.pipeline` package is an embedded dataflow DSL: a
+fluent builder over a pure-data operator graph, evaluated lazily by an
+interpreter. It is unrelated to the experimental
+:class:`~neo4j_graphrag.experimental.pipeline.Pipeline` orchestrator above.
+
+Pipeline
+========
+
+.. autoclass:: neo4j_graphrag.pipeline.Pipeline
+    :members:
+
+ResultPipeline
+==============
+
+.. autoclass:: neo4j_graphrag.pipeline.ResultPipeline
+    :members:
+
+SimpleKGPipeline
+================
+
+.. autoclass:: neo4j_graphrag.pipeline.kg_builder.SimpleKGPipeline
+    :members: run_async
+
+Sources and sinks
+=================
+
+.. autoclass:: neo4j_graphrag.pipeline.sources.FsspecSource
+    :members:
+
+.. autoclass:: neo4j_graphrag.pipeline.sources.FsspecFile
+    :members:
+
+.. autoclass:: neo4j_graphrag.pipeline.sinks.KGWriterSink
+    :members:
+
+.. autoclass:: neo4j_graphrag.pipeline.sinks.InMemoryGraphSink
+    :members:
+
+
 ************
 Config files
 ************

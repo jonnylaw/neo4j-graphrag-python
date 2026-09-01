@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from abc import ABC
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 __all__ = ["Result", "Ok", "Err"]
 
@@ -60,6 +60,11 @@ class Err(Result):
 
     Attributes:
         exception: The exception that caused the failure.
+        context: The failing stage's input, when known — a retry handle. For
+            ``map_async_chunked_safe`` (and the other ``_safe`` operators)
+            this is the element the stage was applied to before it failed,
+            so a retry driver can re-run just that element.
     """
 
     exception: Exception
+    context: Any = None

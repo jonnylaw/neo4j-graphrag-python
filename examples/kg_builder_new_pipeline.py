@@ -18,9 +18,12 @@
 This example uses :class:`neo4j_graphrag.pipeline.kg_builder.SimpleKGPipeline`,
 the successor of the experimental pipeline shown in ``examples/kg_builder.py``.
 Instead of wiring components into a DAG by hand, documents flow from a
-``Source`` through a single operator chain (load → split → embed → extract →
-prune → link → write) into a ``Sink``, with bounded memory and per-chunk
-error handling.
+``Source`` through a single operator chain (load → resolve schema → split →
+embed → extract → prune → write) into a ``Sink``, one graph per document,
+with per-chunk error handling. Extraction runs per chunk with the lexical
+graph (Document and Chunk nodes) included; the ``NEXT_CHUNK`` chain is
+rebuilt from a ``prev_chunk_uid`` stamp the splitter leaves on each chunk,
+outside the failable LLM path.
 
 This example assumes a Neo4j db is up and running. Update the credentials
 below if needed.
@@ -128,8 +131,9 @@ async def define_and_run_pipeline(
     neo4j_driver: neo4j.Driver, llm: LLMInterface
 ) -> SimpleKGPipelineResult:
     # The new SimpleKGPipeline builds the whole operator chain for you:
-    # load -> resolve schema -> split -> embed -> extract -> prune ->
-    # link chunks -> merge write batches -> write to Neo4j.
+    # load -> resolve schema -> split -> embed -> extract -> prune -> write.
+    # Each document is written as it completes, and a chunk that fails
+    # extraction only loses that chunk's graph.
     kg_builder = SimpleKGPipeline(
         llm=llm,
         driver=neo4j_driver,

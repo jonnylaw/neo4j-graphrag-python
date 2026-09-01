@@ -37,12 +37,14 @@ from neo4j_graphrag.components.types import (
     LoadedDocument,
     Neo4jGraph,
     Neo4jNode,
+    Neo4jRelationship,
     TextChunk,
     TextChunks,
 )
 from neo4j_graphrag.embeddings import Embedder
 from neo4j_graphrag.llm.base import LLMInterface
-from neo4j_graphrag.pipeline.kg_builder import SimpleKGPipeline
+from neo4j_graphrag.pipeline.interpreter import AsyncInterpreter
+from neo4j_graphrag.pipeline.kg_builder import SimpleKGPipeline, _ChunkPart
 from neo4j_graphrag.pipeline.sinks import InMemoryGraphSink
 
 CHUNKS = [TextChunk(text="chunk-0", index=0), TextChunk(text="chunk-1", index=1)]
@@ -60,6 +62,33 @@ def _set_async_mock(obj: Any, name: str, **kwargs: Any) -> AsyncMock:
     return mock
 
 
+def _lexical_graph(chunks: list[TextChunk], doc_id: str = "doc-uid") -> Neo4jGraph:
+    """The lexical graph built up front: Document + Chunk nodes, FROM_DOCUMENT
+    edges per chunk, and an unbroken NEXT_CHUNK chain."""
+    nodes: list[Neo4jNode] = [
+        Neo4jNode(id=doc_id, label="Document"),
+        *(Neo4jNode(id=c.uid, label="Chunk") for c in chunks),
+    ]
+    relationships: list[Neo4jRelationship] = [
+        *(
+            Neo4jRelationship(
+                start_node_id=c.uid, end_node_id=doc_id, type="FROM_DOCUMENT"
+            )
+            for c in chunks
+        ),
+        *(
+            Neo4jRelationship(start_node_id=p.uid, end_node_id=n.uid, type="NEXT_CHUNK")
+            for p, n in zip(chunks, chunks[1:])
+        ),
+    ]
+    return Neo4jGraph(nodes=nodes, relationships=relationships)
+
+
+def _entity_graph(chunk: TextChunk) -> Neo4jGraph:
+    """One entity per chunk, with ids scoped to the chunk."""
+    return Neo4jGraph(nodes=[Neo4jNode(id=f"e{chunk.index}", label="Entity")])
+
+
 def _make_pipe(**kwargs: Any) -> SimpleKGPipeline:
     llm = MagicMock(spec=LLMInterface)
     llm.supports_structured_output = False
@@ -75,7 +104,9 @@ def _make_pipe(**kwargs: Any) -> SimpleKGPipeline:
     _set_async_mock(
         pipe.file_loader,
         "run",
-        return_value=LoadedDocument(
+        # a fresh DocumentInfo per call, so each loaded file gets its own uid
+        # (matching what the real loaders produce)
+        side_effect=lambda **kwargs: LoadedDocument(
             text="Some text.",
             document_info=DocumentInfo(path="doc.md"),
         ),
@@ -93,23 +124,16 @@ def _make_pipe(**kwargs: Any) -> SimpleKGPipeline:
         pipe.lexical_graph_builder,
         "run",
         side_effect=lambda text_chunks, document_info: MagicMock(
-            graph=Neo4jGraph(
-                nodes=[
-                    Neo4jNode(id=text_chunks.chunks[0].uid, label="Chunk"),
-                    Neo4jNode(id=document_info.uid, label="Document"),
-                ]
-            )
+            graph=_lexical_graph(text_chunks.chunks)
         ),
     )
+    _set_async_mock(pipe.lexical_graph_builder, "process_chunk_extracted_entities")
     pipe.extractor = MagicMock()
     _set_async_mock(
         pipe.extractor,
         "extract_chunk",
-        side_effect=lambda chunk, schema, examples, builder: Neo4jGraph(
-            nodes=[Neo4jNode(id=f"e{chunk.index}", label="Entity")]
-        ),
+        side_effect=lambda chunk, schema, examples="": _entity_graph(chunk),
     )
-    pipe.extractor.combine_chunk_graphs = MagicMock(side_effect=_combine)
     pipe.pruner = MagicMock()
     _set_async_mock(
         pipe.pruner,
@@ -121,18 +145,6 @@ def _make_pipe(**kwargs: Any) -> SimpleKGPipeline:
     if pipe.resolver is not None:
         _set_async_mock(pipe.resolver, "run", return_value=None)
     return pipe
-
-
-def _combine(lexical_graph: Any, chunk_graphs: list[Neo4jGraph]) -> Neo4jGraph:
-    """The real ``combine_chunk_graphs`` behaviour, for the mocked extractor."""
-    graph = Neo4jGraph()
-    if lexical_graph is not None:
-        graph.nodes.extend(lexical_graph.nodes)
-        graph.relationships.extend(lexical_graph.relationships)
-    for chunk_graph in chunk_graphs:
-        graph.nodes.extend(chunk_graph.nodes)
-        graph.relationships.extend(chunk_graph.relationships)
-    return graph
 
 
 def _with_memory_sink(pipe: SimpleKGPipeline) -> InMemoryGraphSink:
@@ -160,13 +172,15 @@ async def test_run_async_full_flow(tmp_path: Path) -> None:
 
     result = await pipe.run_async(file_path=_write_md(tmp_path))
 
-    # load and split once, then every later stage runs per chunk
     assert _async_mock(pipe.file_loader.run).await_count == 1
     assert _async_mock(pipe.text_splitter.run).await_count == 1
-    assert _async_mock(pipe.chunk_embedder.run).await_count == 2
-    assert _async_mock(pipe.lexical_graph_builder.run).await_count == 2
+    assert _async_mock(pipe.chunk_embedder.run).await_count == 1
+    # lexical graph built once (per document) ...
+    assert _async_mock(pipe.lexical_graph_builder.run).await_count == 1
+    # ... extraction runs once per chunk
     assert _async_mock(pipe.extractor.extract_chunk).await_count == 2
-    assert _async_mock(pipe.pruner.run).await_count == 2
+    # prune runs once per document
+    assert _async_mock(pipe.pruner.run).await_count == 1
     assert {n.id for n in sink.graph.nodes} >= {"e0", "e1"}
     assert pipe.resolver is not None
     assert _async_mock(pipe.resolver.run).await_count == 1
@@ -174,43 +188,78 @@ async def test_run_async_full_flow(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_lexical_graph_is_built_one_chunk_at_a_time(tmp_path: Path) -> None:
-    pipe = _make_pipe(perform_entity_resolution=False)
-    _with_memory_sink(pipe)
+async def test_run_async_with_async_interpreter(tmp_path: Path) -> None:
+    """A caller-supplied AsyncInterpreter drives the whole run on the
+    caller's event loop, including through a KGWriterSink whose ``write``
+    makes its own (thread-offloaded) ``asyncio.run`` call."""
+    writer = MagicMock(spec=KGWriter)
+    writer.run = AsyncMock(return_value=KGWriterModel(status="SUCCESS", metadata=None))
+    pipe = _make_pipe(
+        kg_writer=writer,
+        perform_entity_resolution=False,
+        interpreter=AsyncInterpreter(),
+    )
 
-    await pipe.run_async(file_path=_write_md(tmp_path))
+    result = await pipe.run_async(file_path=_write_md(tmp_path))
 
-    for call in _async_mock(pipe.lexical_graph_builder.run).await_args_list:
-        assert len(call.kwargs["text_chunks"].chunks) == 1
+    assert _async_mock(pipe.extractor.extract_chunk).await_count == 2
+    assert writer.run.await_count == 1
+    assert [w.status for w in result.writer] == ["SUCCESS"]
+    assert result.errors == []
 
 
 @pytest.mark.asyncio
-async def test_next_chunk_relationship_links_consecutive_chunks(
-    tmp_path: Path,
-) -> None:
+async def test_next_chunk_relationship_is_unbroken(tmp_path: Path) -> None:
     pipe = _make_pipe(perform_entity_resolution=False)
     sink = _with_memory_sink(pipe)
 
     await pipe.run_async(file_path=_write_md(tmp_path))
 
-    next_chunk_type = LexicalGraphConfig().next_chunk_relationship_type
-    linked = [r for r in sink.graph.relationships if r.type == next_chunk_type]
+    config = LexicalGraphConfig()
+    linked = [
+        r
+        for r in sink.graph.relationships
+        if r.type == config.next_chunk_relationship_type
+    ]
     # two chunks -> exactly one NEXT_CHUNK edge, from the first to the second
-    assert len(linked) == 1
-    chunk_ids = [c.uid for c in _async_mock(pipe.text_splitter.run).return_value.chunks]
-    assert (linked[0].start_node_id, linked[0].end_node_id) == tuple(chunk_ids)
+    assert [(r.start_node_id, r.end_node_id) for r in linked] == [
+        tuple(c.uid for c in CHUNKS)
+    ]
 
 
 @pytest.mark.asyncio
-async def test_duplicate_document_nodes_collapse_on_merge(tmp_path: Path) -> None:
-    pipe = _make_pipe(perform_entity_resolution=False)
+async def test_lexical_graph_survives_failing_chunk(tmp_path: Path) -> None:
+    """The regression this pipeline exists to prevent: a chunk that fails
+    extraction must not take its Chunk node or the NEXT_CHUNK chain with it."""
+    pipe = _make_pipe(on_error="IGNORE", perform_entity_resolution=False)
     sink = _with_memory_sink(pipe)
 
-    await pipe.run_async(file_path=_write_md(tmp_path))
+    async def _extract(
+        chunk: TextChunk, schema: GraphSchema, examples: str = ""
+    ) -> Neo4jGraph:
+        if chunk.index == 1:
+            raise ValueError("extraction failed")
+        return _entity_graph(chunk)
 
-    # each chunk graph repeats the Document node; the merge deduplicates it
-    document_nodes = [n for n in sink.graph.nodes if n.label == "Document"]
-    assert len(document_nodes) == 1
+    _set_async_mock(pipe.extractor, "extract_chunk", side_effect=_extract)
+
+    result = await pipe.run_async(file_path=_write_md(tmp_path))
+
+    node_ids = {n.id for n in sink.graph.nodes}
+    # chunk 1's entity is gone ...
+    assert "e1" not in node_ids
+    assert "e0" in node_ids
+    # ... but every Chunk node survives and the NEXT_CHUNK chain is intact
+    chunk_ids = [c.uid for c in CHUNKS]
+    assert set(chunk_ids) <= node_ids
+    linked = [r for r in sink.graph.relationships if r.type == "NEXT_CHUNK"]
+    assert [(r.start_node_id, r.end_node_id) for r in linked] == [tuple(chunk_ids)]
+    assert len(result.errors) == 1
+    assert isinstance(result.errors[0].exception, ValueError)
+    # the retry handle is the failed chunk, so a retry driver can re-run it
+    err = result.errors[0]
+    assert isinstance(err.context, _ChunkPart)
+    assert err.context.chunk.index == 1
 
 
 @pytest.mark.asyncio
@@ -243,16 +292,22 @@ async def test_run_async_loads_file_with_metadata(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_async_from_directory_loads_each_file(tmp_path: Path) -> None:
-    pipe = _make_pipe(perform_entity_resolution=False)
-    _with_memory_sink(pipe)
+async def test_run_async_from_directory_writes_each_file_separately(
+    tmp_path: Path,
+) -> None:
+    writer = MagicMock(spec=KGWriter)
+    writer.run = AsyncMock(return_value=KGWriterModel(status="SUCCESS", metadata=None))
+    pipe = _make_pipe(kg_writer=writer, perform_entity_resolution=False)
     _write_md(tmp_path, "a.md")
     _write_md(tmp_path, "b.md")
 
-    await pipe.run_async(file_path=str(tmp_path))
+    result = await pipe.run_async(file_path=str(tmp_path))
 
     assert _async_mock(pipe.file_loader.run).await_count == 2
-    assert _async_mock(pipe.text_splitter.run).await_count == 2
+    assert _async_mock(pipe.lexical_graph_builder.run).await_count == 2
+    # each document is written as it completes
+    assert writer.run.await_count == 2
+    assert len(result.writer) == 2
 
 
 @pytest.mark.asyncio
@@ -268,18 +323,16 @@ async def test_default_sink_records_writer_results(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_all_chunks_are_written_in_a_single_call(tmp_path: Path) -> None:
-    """The reduce merges every chunk graph; the sink sees one graph per run."""
+async def test_writer_results_do_not_leak_between_runs(tmp_path: Path) -> None:
     writer = MagicMock(spec=KGWriter)
     writer.run = AsyncMock(return_value=KGWriterModel(status="SUCCESS", metadata=None))
     pipe = _make_pipe(kg_writer=writer, perform_entity_resolution=False)
 
-    result = await pipe.run_async(file_path=_write_md(tmp_path))
+    first = await pipe.run_async(file_path=_write_md(tmp_path))
+    second = await pipe.run_async(file_path=_write_md(tmp_path))
 
-    writer.run.assert_awaited_once()
-    written = writer.run.await_args.kwargs["graph"]
-    assert {n.id for n in written.nodes} >= {"e0", "e1"}
-    assert len(result.writer) == 1
+    assert len(first.writer) == 1
+    assert len(second.writer) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -292,59 +345,34 @@ def test_invalid_map_batch_size_raises() -> None:
         _make_pipe(map_batch_size=0)
 
 
+def test_unknown_schema_literal_raises() -> None:
+    with pytest.raises(ValueError, match="Unknown schema value"):
+        _make_pipe(schema="NOT_A_SCHEMA")
+
+
+def test_defaults_are_not_shared_between_instances() -> None:
+    pipe_a = _make_pipe(perform_entity_resolution=False)
+    pipe_b = _make_pipe(perform_entity_resolution=False)
+    assert pipe_a.text_splitter is not pipe_b.text_splitter
+    assert pipe_a.file_loader is not pipe_b.file_loader
+
+
 # ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_on_error_ignore_captures_chunk_failures(tmp_path: Path) -> None:
+async def test_on_error_ignore_captures_extract_failures(tmp_path: Path) -> None:
     pipe = _make_pipe(on_error="IGNORE", perform_entity_resolution=False)
     sink = _with_memory_sink(pipe)
-
-    async def _extract(chunk: TextChunk, *args: Any) -> Neo4jGraph:
-        if chunk.index == 1:
-            raise ValueError("extraction failed")
-        return Neo4jGraph(nodes=[Neo4jNode(id=f"e{chunk.index}", label="Entity")])
-
-    _set_async_mock(pipe.extractor, "extract_chunk", side_effect=_extract)
+    _set_async_mock(pipe.extractor, "extract_chunk", side_effect=ValueError("boom"))
 
     result = await pipe.run_async(file_path=_write_md(tmp_path))
 
-    node_ids = {n.id for n in sink.graph.nodes}
-    assert "e0" in node_ids
-    assert "e1" not in node_ids
-    assert len(result.errors) == 1
-    assert isinstance(result.errors[0].exception, ValueError)
-
-
-@pytest.mark.asyncio
-async def test_on_error_ignore_captures_lexical_graph_failures(
-    tmp_path: Path,
-) -> None:
-    pipe = _make_pipe(on_error="IGNORE", perform_entity_resolution=False)
-    sink = _with_memory_sink(pipe)
-
-    async def _build(text_chunks: TextChunks, document_info: Any) -> Any:
-        if text_chunks.chunks[0].index == 1:
-            raise ValueError("lexical graph failed")
-        return MagicMock(
-            graph=Neo4jGraph(
-                nodes=[Neo4jNode(id=text_chunks.chunks[0].uid, label="Chunk")]
-            )
-        )
-
-    _set_async_mock(pipe.lexical_graph_builder, "run", side_effect=_build)
-
-    result = await pipe.run_async(file_path=_write_md(tmp_path))
-
-    node_ids = {n.id for n in sink.graph.nodes}
-    assert "e0" in node_ids
-    assert "e1" not in node_ids
-    # the failing chunk never reaches the extraction stage
-    assert _async_mock(pipe.extractor.extract_chunk).await_count == 1
-    assert len(result.errors) == 1
-    assert isinstance(result.errors[0].exception, ValueError)
+    # both chunks fail extraction, so no entities, but the lexical graph survives
+    assert {n.id for n in sink.graph.nodes} == {"doc-uid", *[c.uid for c in CHUNKS]}
+    assert len(result.errors) == 2
 
 
 @pytest.mark.asyncio
@@ -357,7 +385,6 @@ async def test_errors_do_not_leak_between_runs(tmp_path: Path) -> None:
     second = await pipe.run_async(file_path=_write_md(tmp_path))
 
     assert len(first.errors) == 2
-    # the second run reports only its own errors, not the first run's
     assert len(second.errors) == 2
 
 
@@ -369,6 +396,18 @@ async def test_on_error_raise_aborts_run(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="boom"):
         await pipe.run_async(file_path=_write_md(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_embed_failure_is_captured_with_on_error_ignore(tmp_path: Path) -> None:
+    pipe = _make_pipe(on_error="IGNORE", perform_entity_resolution=False)
+    _with_memory_sink(pipe)
+    _set_async_mock(pipe.chunk_embedder, "run", side_effect=ValueError("embed failed"))
+
+    result = await pipe.run_async(file_path=_write_md(tmp_path))
+
+    assert len(result.errors) == 1
+    assert _async_mock(pipe.lexical_graph_builder.run).await_count == 0
 
 
 @pytest.mark.asyncio
