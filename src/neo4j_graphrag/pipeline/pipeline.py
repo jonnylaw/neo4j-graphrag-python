@@ -288,8 +288,9 @@ class Pipeline(Generic[T]):
         *map_batch_size* elements at a time are dispatched via
         ``asyncio.gather``; each chunk's results are yielded before the next
         chunk is fetched, bounding memory usage.  Evaluation is **blocking**
-        (``asyncio.run`` per chunk) — see the interpreter documentation for
-        the restrictions this implies.
+        (``asyncio.run`` per chunk, or a dedicated event-loop thread when the
+        caller already has a running loop, e.g. in Jupyter) — see the
+        interpreter documentation for the restriction this implies.
 
         Args:
             func: An async callable ``T → Awaitable[U]``.

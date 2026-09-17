@@ -103,9 +103,26 @@ class FixedSizeSplitter(TextSplitter):
         self.chunk_overlap = chunk_overlap
         self.approximate = approximate
 
-    @validate_call
     async def run(self, text: str) -> TextChunks:
         """Splits a piece of text into chunks.
+
+        Component interface: delegates to :meth:`split`, which does the work
+        synchronously.
+
+        Args:
+            text (str): The text to be split.
+
+        Returns:
+            TextChunks: A list of chunks.
+        """
+        return self.split(text)
+
+    @validate_call
+    def split(self, text: str) -> TextChunks:
+        """Splits a piece of text into chunks (synchronously).
+
+        Splitting is pure string slicing with no I/O, so this method is
+        synchronous; the component interface (:meth:`run`) stays async.
 
         Args:
             text (str): The text to be split.

@@ -21,6 +21,7 @@ via ``asyncio.run()``, so no running event loop is present during the test.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable
 from typing import Any
 
@@ -357,6 +358,22 @@ class TestMapAsyncChunked:
             .collect()
         )
         assert result == [2, 4, 6, 8, 10]
+
+    def test_evaluates_from_within_a_running_event_loop(self) -> None:
+        """Jupyter cells run with a running loop: asyncio.run would raise there,
+        so chunks must be driven on a dedicated event-loop thread instead."""
+
+        async def main() -> list[int]:
+            return Pipeline([1, 2, 3]).map_async_chunked(_double).collect()
+
+        assert asyncio.run(main()) == [2, 4, 6]
+
+    def test_errors_propagate_from_within_a_running_event_loop(self) -> None:
+        async def main() -> None:
+            Pipeline([1, 2, 3]).map_async_chunked(_fail_on_even).collect()
+
+        with pytest.raises(ValueError, match="even"):
+            asyncio.run(main())
 
 
 # ---------------------------------------------------------------------------

@@ -77,6 +77,23 @@ async def test_split_text_empty_string() -> None:
     assert chunks.chunks == []
 
 
+def test_split_matches_run_without_event_loop() -> None:
+    """The sync `split` does the splitting itself; `run` only delegates to it."""
+    text = "may thy knife chip and shatter"
+    splitter = FixedSizeSplitter(chunk_size=10, chunk_overlap=2, approximate=False)
+    sync_chunks = splitter.split(text)
+    async_chunks = asyncio.run(splitter.run(text))
+    assert [c.text for c in sync_chunks.chunks] == [
+        "may thy kn",
+        "knife chip",
+        "ip and sha",
+        "hatter",
+    ]
+    assert [c.text for c in async_chunks.chunks] == [
+        c.text for c in sync_chunks.chunks
+    ]
+
+
 def test_invalid_chunk_overlap() -> None:
     with pytest.raises(ValueError) as excinfo:
         FixedSizeSplitter(5, 5)

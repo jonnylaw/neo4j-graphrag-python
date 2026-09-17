@@ -26,18 +26,19 @@ consumed (``collect()``, ``to_sink()``, or direct iteration).
 Async stages are evaluated **blocking**: each chunk of ``map_batch_size``
 items is dispatched with ``asyncio.gather`` inside its own
 ``asyncio.run()`` call, and its results are yielded before the next chunk
-is fetched.  This bounds memory usage and keeps the interpreter
-synchronous, at the cost of two restrictions:
+is fetched.  When the calling thread already has a running event loop
+(e.g. a Jupyter kernel), chunks are driven on a dedicated event-loop
+thread instead — the caller keeps its synchronous API either way.  This
+bounds memory usage and keeps the interpreter synchronous, at the cost of
+one restriction:
 
-* async operators must not be evaluated from within a running event loop
-  (use ``asyncio.to_thread`` at the call site if needed), and
 * async clients that bind to an event loop (``httpx.AsyncClient``,
-  ``aiohttp.ClientSession``) must be created *inside* the async function
-  rather than shared across chunks, because each chunk runs on a fresh
-  event loop.
+  ``aiohttp.ClientSession``) should be created *inside* the async function
+  rather than shared across chunks, because in the plain (no running loop)
+  path each chunk runs on a fresh event loop.
 
 A future ``AsyncInterpreter`` (whole chain on a single event loop) would
-lift both restrictions; the operator-graph representation already supports
+lift this restriction; the operator-graph representation already supports
 it.
 """
 
@@ -45,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator
 from functools import reduce as _reduce
@@ -177,6 +179,29 @@ def _batched(iterable: Iterable[_T], n: int) -> Iterator[list[_T]]:
         yield batch
 
 
+class _LoopThread:
+    """An event loop running on a dedicated thread.
+
+    Used to evaluate async chunks when the calling thread already has a
+    running event loop (e.g. a Jupyter kernel), where ``asyncio.run`` would
+    raise ``RuntimeError``.  One loop serves every chunk of an evaluation;
+    :meth:`run` blocks the caller until the coroutine completes.
+    """
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._thread.start()
+
+    def run(self, coro: Coroutine[None, None, _U]) -> _U:
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def close(self) -> None:
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join()
+        self._loop.close()
+
+
 def _iter_chunked_async(
     stream: Iterable[_T],
     map_batch_size: int,
@@ -186,7 +211,9 @@ def _iter_chunked_async(
 
     Iterates *stream* in chunks of *map_batch_size* and, for each chunk,
     calls ``asyncio.run(make_chunk_coro(chunk))``, yielding all results
-    before moving to the next chunk.
+    before moving to the next chunk.  When the calling thread already has a
+    running event loop (e.g. in Jupyter), chunks are instead driven on a
+    dedicated event-loop thread via :class:`_LoopThread`.
 
     Raises:
         ValueError: If *map_batch_size* < 1.  (Builders validate eagerly;
@@ -194,8 +221,18 @@ def _iter_chunked_async(
     """
     if map_batch_size < 1:
         raise ValueError(f"map_batch_size must be >= 1, got {map_batch_size!r}")
-    for chunk in _batched(stream, map_batch_size):
-        yield from asyncio.run(make_chunk_coro(chunk))
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        for chunk in _batched(stream, map_batch_size):
+            yield from asyncio.run(make_chunk_coro(chunk))
+        return
+    loop_thread = _LoopThread()
+    try:
+        for chunk in _batched(stream, map_batch_size):
+            yield from loop_thread.run(make_chunk_coro(chunk))
+    finally:
+        loop_thread.close()
 
 
 def _make_map_chunk_coro(
